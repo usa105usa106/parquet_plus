@@ -59,13 +59,18 @@ TIME_MODES: list[tuple[str, int]] = [
     ("4 часа", 4 * 60 * 60),
 ]
 
-BTN_GMAIL_CHECK = "gmail_check"
-BTN_GMAIL_CONFIG = "gmail_config"
-BTN_GMAIL_LOGIN = "gmail_login"
 BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
-BTN_GMAIL_OAUTH_SETUP = "gmail_oauth_setup"
+
+# Callback ids from older builds. v007 never launches OAuth/callback setup.
+STALE_GMAIL_CALLBACKS = {
+    "gmail_check",
+    "gmail_config",
+    "gmail_login",
+    "gmail_oauth_setup",
+}
+
 
 
 class Runtime:
@@ -339,7 +344,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Анализ/1: бот сам делает свежий анализ и присылает только финальный вердикт.\n"
         "Parquet: собирает top-100 свечи/данные без выбора LONG/SHORT, отправляет ZIP в Telegram, затем в Gmail.\n"
         "Время: выкл → 15 мин → 30 мин → 1 час → 4 часа; повторяет то действие, которым запущен цикл.\n"
-        "Почта: то же, что /gmail.\n"
+        "Почта: импорт сохранённой Gmail-авторизации одной Base64-строкой; без callback/OAuth.\n"
         "Пинг: версия/отклик/uptime/RAM. /status — состояние. /log_full — полный журнал операций.",
         reply_markup=_keyboard(runtime, chat_id),
     )
@@ -785,14 +790,26 @@ async def time_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text(text, reply_markup=_keyboard(runtime, chat_id))
 
 
-# ------------------------- Gmail OAuth UI -------------------------
+# ------------------------- Gmail session import UI -------------------------
 
 def _gmail_connected_menu(runtime: Runtime) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧪 Отправить тест", callback_data=BTN_GMAIL_TEST)],
-        [InlineKeyboardButton("🔑 Заменить Client ID/Secret", callback_data=BTN_GMAIL_CONFIG)],
+        [InlineKeyboardButton("♻️ Заменить авторизацию", callback_data=BTN_GMAIL_IMPORT)],
         [InlineKeyboardButton("❌ Отключить Gmail", callback_data=BTN_GMAIL_DISCONNECT)],
     ])
+
+
+async def _request_gmail_import(message: Any, runtime: Runtime, user_id: int | None, chat_id: int) -> None:
+    if user_id is not None:
+        runtime.awaiting[user_id] = {"step": "gmail_import_bundle"}
+    log.info("gmail_import requested chat_id=%s", chat_id)
+    await message.reply_text(
+        f"📥 Gmail import · {BOT_VERSION}\n"
+        "Отправь ОДНИМ сообщением сохранённую Base64-строку авторизации из старого бота.\n"
+        "Сообщение со строкой удалю сразу после получения. Авторизация действует до следующего redeploy.\n"
+        "/cancel — отмена."
+    )
 
 
 async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -803,73 +820,17 @@ async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if runtime.gmail.connected:
         await update.effective_message.reply_text(
             f"✅ Gmail подключён: {runtime.gmail.account_email}\n"
-            f"Автоотправка: {'ON' if runtime.settings.gmail_auto_send_archives else 'OFF'}\n"
-            f"Режим авторизации: {'до следующего redeploy' if runtime.settings.gmail_session_only else 'постоянный'}\n"
-            "Архив сначала уходит в Telegram как обычный .zip, затем теми же ZIP-байтами — в Gmail как .zip.jpg.",
+            f"Версия: {BOT_VERSION}\n"
+            "Режим: сессионный — после redeploy импортируй ту же строку снова.\n"
+            "Архив: сначала .zip в Telegram, затем те же ZIP-байты в Gmail как .zip.jpg.",
             reply_markup=_gmail_connected_menu(runtime),
         )
         return
-
-    if update.effective_user:
-        runtime.awaiting[update.effective_user.id] = {"step": "gmail_import_bundle"}
-    log.info("Gmail session import requested chat_id=%s", chat_id)
-    buttons = []
-    if runtime.settings.gmail_public_base_url:
-        buttons.append([InlineKeyboardButton("🔐 Обычное OAuth-подключение", callback_data=BTN_GMAIL_OAUTH_SETUP)])
-    await update.effective_message.reply_text(
-        "📥 Отправь сюда одной строкой экспорт Gmail-авторизации из старого бота.\n"
-        "Сообщение со строкой бот сразу удалит. Авторизация действует до следующего redeploy.\n"
-        "/cancel — отмена.",
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-    )
-
-
-async def _gmail_oauth_setup(message: Any, runtime: Runtime, chat_id: int) -> None:
-    if not runtime.settings.gmail_public_base_url:
-        await message.reply_text(
-            "❌ Coolify public URL для Gmail callback не найден. Используй сервис с public HTTPS URL, который ведёт на container port 80."
-        )
-        return
-    if not runtime.gmail.is_health_probe_confirmed(chat_id):
-        try:
-            probe_url = runtime.gmail.create_health_probe_url(chat_id)
-        except GmailOAuthError as exc:
-            await message.reply_text(f"❌ Gmail callback: {exc}")
-            return
-        await message.reply_text(
-            "Сначала проверим внешний callback Coolify:\n1) открой ссылку; 2) вернись и нажми Проверить результат.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌐 1. Открыть проверку сервера", url=probe_url)],
-                [InlineKeyboardButton("✅ 2. Проверить результат", callback_data=BTN_GMAIL_CHECK)],
-            ]),
-        )
-        return
-    await _gmail_ready(message, runtime, chat_id)
-
-
-async def _gmail_ready(message: Any, runtime: Runtime, chat_id: int) -> None:
-    if not runtime.gmail.configured:
-        await message.reply_text(
-            "✅ Callback работает. Создай Google OAuth Client типа Web application и добавь Redirect URI:\n"
-            f"{runtime.settings.gmail_redirect_uri}\n\n"
-            "После этого нажми кнопку ниже.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 Ввести Client ID и Secret", callback_data=BTN_GMAIL_CONFIG)],
-            ]),
-            disable_web_page_preview=True,
-        )
-        return
-    try:
-        url = runtime.gmail.create_authorization_url(chat_id)
-    except GmailOAuthError as exc:
-        await message.reply_text(f"❌ Gmail OAuth: {exc}")
-        return
-    await message.reply_text(
-        "✅ Client ID/Secret сохранены. Нажми «Войти через Google». После callback бот подтвердит подключение сам.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔐 Войти через Google", url=url)],
-            [InlineKeyboardButton("🔑 Заменить Client ID/Secret", callback_data=BTN_GMAIL_CONFIG)],
-        ]),
+    await _request_gmail_import(
+        update.effective_message,
+        runtime,
+        update.effective_user.id if update.effective_user else None,
+        chat_id,
     )
 
 
@@ -882,55 +843,44 @@ async def gmail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await query.answer()
     chat_id = update.effective_chat.id
-    data = query.data
+    data = query.data or ""
+
     if data == BTN_GMAIL_IMPORT:
-        if update.effective_user:
-            runtime.awaiting[update.effective_user.id] = {"step": "gmail_import_bundle"}
-        await query.message.reply_text(
-            "Отправь строку экспорта Gmail-авторизации одним сообщением. Я сразу удалю её. /cancel — отмена."
+        await _request_gmail_import(
+            query.message,
+            runtime,
+            update.effective_user.id if update.effective_user else None,
+            chat_id,
         )
         return
-    if data == BTN_GMAIL_OAUTH_SETUP:
-        if update.effective_user:
-            runtime.awaiting.pop(update.effective_user.id, None)
-        await _gmail_oauth_setup(query.message, runtime, chat_id)
-        return
-    if data == BTN_GMAIL_CHECK:
-        if runtime.gmail.is_health_probe_confirmed(chat_id):
-            await _gmail_ready(query.message, runtime, chat_id)
-        else:
-            url = runtime.gmail.create_health_probe_url(chat_id)
-            await query.message.reply_text(
-                "❌ Внешний callback ещё не подтверждён.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🌐 Открыть проверку ещё раз", url=url)],
-                    [InlineKeyboardButton("✅ Проверить результат", callback_data=BTN_GMAIL_CHECK)],
-                ]),
-            )
-        return
-    if data == BTN_GMAIL_CONFIG:
-        try:
-            runtime.gmail.require_health_probe(chat_id)
-        except GmailOAuthError as exc:
-            await query.message.reply_text(f"❌ {exc}\nСначала /gmail и проверка callback.")
-            return
-        if not update.effective_user:
-            return
-        runtime.awaiting[update.effective_user.id] = {"step": "gmail_client_id"}
-        await query.message.reply_text(
-            "Отправь Google Client ID одним сообщением. Сообщение будет сразу удалено. /cancel — отмена."
-        )
-        return
+
     if data == BTN_GMAIL_TEST:
         try:
             await runtime.gmail.send_test()
             await query.message.reply_text(f"✅ Тестовое письмо отправлено: {runtime.gmail.account_email}")
         except Exception as exc:  # noqa: BLE001
-            await query.message.reply_text(f"❌ Gmail test: {exc}")
+            log.warning("gmail_test failed chat_id=%s error_type=%s", chat_id, type(exc).__name__)
+            await query.message.reply_text(f"❌ Gmail test: {type(exc).__name__}")
         return
+
     if data == BTN_GMAIL_DISCONNECT:
         runtime.gmail.disconnect()
-        await query.message.reply_text("Gmail отключён. Для быстрого подключения снова нажми «Почта» и отправь строку импорта.")
+        if update.effective_user:
+            runtime.awaiting.pop(update.effective_user.id, None)
+        log.info("gmail_session disconnected chat_id=%s", chat_id)
+        await query.message.reply_text(
+            "Gmail отключён. Нажми «Почта» и снова отправь сохранённую строку авторизации."
+        )
+        return
+
+    if data in STALE_GMAIL_CALLBACKS or data.startswith("gmail_"):
+        if update.effective_user:
+            runtime.awaiting.pop(update.effective_user.id, None)
+        log.info("stale_gmail_callback blocked chat_id=%s data=%s", chat_id, data)
+        await query.message.reply_text(
+            f"Эта кнопка от старой версии. В {BOT_VERSION} callback/OAuth отключён. "
+            "Нажми обычную кнопку «Почта» и отправь сохранённую строку авторизации."
+        )
         return
 
 
@@ -1017,33 +967,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text=f"❌ Импорт Gmail не принят: {str(exc)[:300]}\nОтправь строку ещё раз или /cancel.",
+                    text=f"❌ Импорт Gmail не принят: {type(exc).__name__}. Отправь строку ещё раз или /cancel.",
                 )
             return
-        if step == "gmail_client_id":
-            try:
-                client_id = runtime.gmail.validate_client_id(text)
-            except GmailOAuthError as exc:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ {exc}\nОтправь Client ID ещё раз.")
-                return
-            flow["gmail_client_id"] = client_id
-            flow["step"] = "gmail_client_secret"
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Client ID принят. Теперь отправь Google Client Secret. Сообщение тоже удалю.")
-            return
-        if step == "gmail_client_secret":
-            client_id = str(flow.get("gmail_client_id") or "")
-            try:
-                runtime.gmail.save_client_credentials(client_id, text)
-                runtime.awaiting.pop(user.id, None)
-                url = runtime.gmail.create_authorization_url(update.effective_chat.id)
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="✅ OAuth Client сохранён зашифрованно. Теперь войди через Google.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Войти через Google", url=url)]]),
-                )
-            except GmailOAuthError as exc:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Gmail OAuth: {exc}")
-            return
+
 
     low = text.lower()
     if text == "1" or low == "анализ":
@@ -1113,7 +1040,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(gmail_callback, pattern="^gmail_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(telegram_error_handler)
-    log.info("Trading + Market Data Bot started version=%s gmail_session_only=%s", BOT_VERSION, settings.gmail_session_only)
+    log.info("Trading + Market Data Bot started version=%s gmail_mode=session_import_only log_full=enabled", BOT_VERSION)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

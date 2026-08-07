@@ -18,10 +18,8 @@ services:
       - GMAIL_OAUTH_LISTEN_PORT=80
       - GMAIL_SESSION_ONLY=true
 
-      # Magic variable Coolify: генерирует публичный URL и route на container port 80.
-      # Для быстрого импорта старой Gmail-сессии callback не требуется, но обычный
-      # OAuth-flow оставлен как запасной вариант.
-      - SERVICE_URL_GMAILAUTH_80
+      # Gmail в v007 подключается только импортом сохранённой сессии через Telegram.
+      # Public callback/Google OAuth redirect URI не используется.
     expose:
       - "80"
     volumes:

@@ -1,4 +1,4 @@
-# Coolify deployment — v006
+# Coolify deployment — v007
 
 ## Что вводить в Coolify
 
@@ -8,27 +8,23 @@
 TELEGRAM_BOT_TOKEN=123456:...
 ```
 
-Остальные значения уже заданы внутри проекта.
+## Порт
 
-## Порты
+Приложение слушает container port `80`, но в v007 он используется только для `/healthz` и Docker/Coolify healthcheck. Google OAuth callback для подключения Gmail **не используется**.
 
-- приложение слушает container port `80`;
-- `/healthz` используется для проверки приложения;
-- `/gmail/callback` нужен только для запасного обычного Google OAuth-flow;
-- `SERVICE_URL_GMAILAUTH_80` позволяет Coolify направить публичный HTTPS URL на container port 80.
+## Gmail
 
-## Быстрый Gmail import
+1. Deploy v007.
+2. Сначала нажать **Пинг** и убедиться, что бот пишет `Версия: v007`.
+3. Нажать **Почта**. Бот обязан ответить строкой `📥 Gmail import · v007`.
+4. Отправить одним Telegram-сообщением сохранённую Base64-строку Gmail-авторизации.
+5. Бот сразу удалит это сообщение, импортирует данные только в память и проверит Gmail.
+6. После restart/redeploy нажать **Почта** и отправить ту же строку снова.
 
-1. Deploy v006.
-2. В Telegram нажать **Почта**.
-3. Отправить одной строкой ранее сохранённый Base64-экспорт Gmail-авторизации старого бота.
-4. Бот сразу удалит сообщение, расшифрует данные в памяти и проверит Google-сессию.
-5. При успехе бот напишет `✅ Почта подключена`.
-
-Импортированная Gmail-авторизация работает **только до следующего restart/redeploy**. Она не записывается в `/app/storage` и не попадает в журналы. После redeploy просто повторите импорт той же строки.
+Если после deploy кнопка **Почта** предлагает «проверить внешний callback», значит Coolify всё ещё запустил старый образ, а не v007.
 
 ## Логи
 
-`/log_full` присылает полный журнал основных операций. Файл `full.log` находится в `/app/storage/logs/` и ротируется. Gmail имеет отдельный `mail.log`.
+`/log_full` присылает полный журнал основных операций. `full.log` хранится в `/app/storage/logs/` и ротируется.
 
-В логи не пишутся тела секретных сообщений, OAuth access/refresh tokens, Client Secret, Fernet key/token, Bearer Authorization, Telegram bot token и длинные Base64-секреты.
+В лог не передаются содержимое Gmail-import, OAuth access/refresh tokens, Client Secret, Fernet key/token, Bearer Authorization, Telegram bot token и длинные Base64-секреты.

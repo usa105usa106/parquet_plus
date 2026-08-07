@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v006
+# Coolify Trading Signal Bot v007
 
 import asyncio
 import logging
@@ -361,7 +361,7 @@ async def _fetch_mexc_derivatives(
     """Fetch MEXC perpetual funding in one public/no-auth request.
 
     MEXC's all-contract ticker includes fundingRate, 24h move/turnover and holdVol.
-    In v006 MEXC is the only funding source; Binance Futures is not queried.
+    In v007 MEXC is the only funding source; Binance Futures is not queried.
     """
     try:
         payload = await _get_json(
@@ -422,7 +422,7 @@ async def _fetch_derivatives(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Fetch derivatives context from MEXC only.
 
-    Funding is intentionally MEXC-only in v006. Binance Futures is not called at
+    Funding is intentionally MEXC-only in v007. Binance Futures is not called at
     all, so an unavailable Binance Futures API cannot delay or alter the scan.
     """
     mexc_rows, mexc_status = await _fetch_mexc_derivatives(client, symbols)
@@ -595,7 +595,7 @@ async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
 async def fetch_market_bundle() -> dict[str, Any]:
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v006)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v007)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
@@ -749,7 +749,7 @@ def _history_bars_from_yahoo(payload: dict[str, Any], now_ts: float) -> list[dic
 
 
 async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Fetch lightweight 1H history for v006 signal statistics.
+    """Fetch lightweight 1H history for v007 signal statistics.
 
     Crypto outcomes are measured on Binance Spot only. Commodity outcomes use
     the exact Yahoo symbol that generated the published setup. No Futures API is
@@ -767,7 +767,7 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
     now_ms = int(now_ts * 1000)
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v006)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v007)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     sem = asyncio.Semaphore(6)

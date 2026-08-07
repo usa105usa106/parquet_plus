@@ -385,29 +385,18 @@ class GmailOAuthManager:
     async def start_web_server(self, bot: Any) -> None:
         self._bot = bot
         self._audit(
-            "local_server_start_requested",
+            "health_server_start_requested",
             listen_host=self.settings.gmail_oauth_listen_host,
             listen_port=self.settings.gmail_oauth_listen_port,
-            redirect_uri=self.settings.gmail_redirect_uri or "missing",
-            health_url=getattr(self.settings, "gmail_health_url", "") or "missing",
         )
         if self._runner is not None:
-            self._audit("local_server_already_started")
+            self._audit("health_server_already_started")
             return
-        # Always start the local server. In older versions a missing Coolify URL
-        # prevented the listener from starting at all, which made the proxy show
-        # "no available server" and hid the real configuration problem.
-        if not self.settings.gmail_redirect_uri:
-            self.logger.warning(
-                "Gmail public URL is missing, but local /healthz still starts for diagnostics."
-            )
-        if not self.configured:
-            self.logger.warning(
-                "Gmail OAuth callback server starts without Google credentials; enter them through Telegram after the public probe succeeds."
-            )
+        # v007 uses Gmail session import only. Port 80 remains solely for
+        # Docker/Coolify health checks; the Google OAuth callback route is not
+        # registered at all.
         app = web.Application(client_max_size=1024 * 1024)
         app.router.add_get("/healthz", self._healthz)
-        app.router.add_get("/gmail/callback", self._oauth_callback)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(
@@ -427,18 +416,14 @@ class GmailOAuthManager:
             )
             raise
         self._audit(
-            "local_server_started",
+            "health_server_started",
             listen_host=self.settings.gmail_oauth_listen_host,
             listen_port=self.settings.gmail_oauth_listen_port,
-            redirect_uri=self.settings.gmail_redirect_uri or "missing",
-            health_url=getattr(self.settings, "gmail_health_url", "") or "missing",
         )
         self.logger.info(
-            "Gmail OAuth server started on %s:%s redirect=%s health=%s",
+            "Health server started on %s:%s endpoint=/healthz",
             self.settings.gmail_oauth_listen_host,
             self.settings.gmail_oauth_listen_port,
-            self.settings.gmail_redirect_uri or "missing",
-            getattr(self.settings, "gmail_health_url", "") or "missing",
         )
 
     async def stop_web_server(self) -> None:

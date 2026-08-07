@@ -1,0 +1,13 @@
+{
+  "version": "v007",
+  "compileall": "ok",
+  "version_sweep": "ok",
+  "gmail_import_synthetic": "ok",
+  "gmail_import_memory_only": "ok",
+  "secret_log_redaction": "ok",
+  "old_oauth_ui_removed": "ok",
+  "gmail_callback_route_registered": false,
+  "healthz_route_registered": true,
+  "log_full_handler_registered": true,
+  "telegram_live_runtime": "not_run_python_telegram_bot_missing_in_local_env"
+}

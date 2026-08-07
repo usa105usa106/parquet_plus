@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v006
+# Coolify Trading Signal Bot v007
 
-BOT_VERSION = "v006"
+BOT_VERSION = "v007"
 
 import math
 import os
@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-USER_TIMEZONE = "Europe/Moscow"  # v006: all user-visible clock times are fixed to MSK (UTC+3)
+USER_TIMEZONE = "Europe/Moscow"  # v007: all user-visible clock times are fixed to MSK (UTC+3)
 MIN_CRYPTO_SCORE = float(os.getenv("MIN_CRYPTO_SCORE", "7.0"))
 MIN_COMMODITY_SCORE = float(os.getenv("MIN_COMMODITY_SCORE", "5.0"))
 
@@ -372,7 +372,7 @@ def _next_event_text(bundle: dict[str, Any]) -> str:
 def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
     """Select the four published setups without formatting them.
 
-    The structured result is used by v006 statistics tracking so outcomes are
+    The structured result is used by v007 statistics tracking so outcomes are
     measured from the exact levels that were shown to the user, not by parsing
     Telegram text.
     """
