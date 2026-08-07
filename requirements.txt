@@ -1,0 +1,5 @@
+python-telegram-bot==22.8
+httpx==0.28.1
+aiohttp>=3.11,<4
+cryptography>=44,<48
+pyarrow>=18,<24

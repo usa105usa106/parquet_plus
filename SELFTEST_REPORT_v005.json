@@ -1,0 +1,47 @@
+{
+  "version": "v005",
+  "isolated_venv": "/mnt/data/v005_test_venv",
+  "three_archive_runs": [
+    {
+      "run": 1,
+      "archive": "market_scan_20260807_185209.zip",
+      "bytes": 10005,
+      "sha256_12": "176637ee49f4",
+      "universe": 100,
+      "binance_full": 100,
+      "mexc_funding_contracts": 88,
+      "commodities_full": 3,
+      "duration_sec": 0.478
+    },
+    {
+      "run": 2,
+      "archive": "market_scan_20260807_185209_241068.zip",
+      "bytes": 10006,
+      "sha256_12": "cab8b5834157",
+      "universe": 100,
+      "binance_full": 100,
+      "mexc_funding_contracts": 88,
+      "commodities_full": 3,
+      "duration_sec": 0.365
+    },
+    {
+      "run": 3,
+      "archive": "market_scan_20260807_185210.zip",
+      "bytes": 10006,
+      "sha256_12": "c82c8e4d8a03",
+      "universe": 100,
+      "binance_full": 100,
+      "mexc_funding_contracts": 88,
+      "commodities_full": 3,
+      "duration_sec": 0.368
+    }
+  ],
+  "gmail_zip_jpg_same_bytes": true,
+  "telegram_archive_suffix": ".zip",
+  "coolify_user_env_required": [
+    "TELEGRAM_BOT_TOKEN"
+  ],
+  "coolify_magic_callback": "SERVICE_URL_GMAILAUTH_80",
+  "secret_store_persists_without_env_key": true,
+  "note": "Upstream HTTP was emulated because this CAAS runtime has no outbound DNS; production dependency versions and Coolify magic-variable behavior were separately checked against current public documentation."
+}

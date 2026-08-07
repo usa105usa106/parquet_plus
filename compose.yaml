@@ -1,0 +1,32 @@
+services:
+  market-scan-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      # Единственная переменная, которую пользователь вводит в Coolify.
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:?}
+
+      # Всё остальное уже настроено внутри проекта.
+      - DATA_ROOT=/app/storage
+      - GMAIL_BACKUP_ROOT=/app/storage_backup
+      - USER_TIMEZONE=Europe/Moscow
+      - GMAIL_AUTO_SEND_ARCHIVES=true
+      - GMAIL_MAX_ATTACHMENT_MB=24
+      - GMAIL_OAUTH_LISTEN_HOST=0.0.0.0
+      - GMAIL_OAUTH_LISTEN_PORT=80
+
+      # Magic variable Coolify: генерирует публичный URL и route на container port 80.
+      # Пользователь значение не вводит.
+      - SERVICE_URL_GMAILAUTH_80
+    expose:
+      - "80"
+    volumes:
+      - market_scan_storage:/app/storage
+      - market_scan_gmail_backup:/app/storage_backup
+
+volumes:
+  market_scan_storage:
+  market_scan_gmail_backup:
