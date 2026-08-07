@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+
+from logging_utils import RedactingFormatter
 from urllib.parse import urlencode
 
 import aiohttp
@@ -105,7 +107,7 @@ class GmailOAuthManager:
         handler = RotatingFileHandler(
             path, maxBytes=10 * 1024 * 1024, backupCount=4, encoding="utf-8"
         )
-        handler.setFormatter(logging.Formatter(
+        handler.setFormatter(RedactingFormatter(
             fmt="%(asctime)s | %(levelname)s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         ))
@@ -268,7 +270,8 @@ class GmailOAuthManager:
         stored_id = str(stored.get("client_id") or "").strip()
         stored_secret = str(stored.get("client_secret") or "").strip()
         if stored_id and stored_secret:
-            return stored_id, stored_secret, "telegram"
+            source = "session-import" if bool(getattr(self.secret_store, "gmail_runtime_imported", False)) else "telegram"
+            return stored_id, stored_secret, source
         env_id = str(self.settings.gmail_client_id or "").strip()
         env_secret = str(self.settings.gmail_client_secret or "").strip()
         if env_id and env_secret:
@@ -679,6 +682,23 @@ class GmailOAuthManager:
                 "Соединение с Gmail оборвалось во время отправки; неизвестно, принято ли письмо. "
                 "Чтобы не создать дубль, этот ZIP автоматически повторно не отправляется."
             ) from exc
+
+    async def verify_connection(self) -> str:
+        """Verify the currently loaded Gmail session without sending mail."""
+        self._audit("gmail_verify_requested", configured=self.configured, connected=self.connected)
+        token = self.secret_store.load_gmail_oauth() or {}
+        if not token or not token.get("refresh_token"):
+            raise GmailOAuthError("Gmail refresh token отсутствует.")
+        access_token = await self._valid_access_token(token)
+        user = await self._load_userinfo(access_token)
+        email_value = str(user.get("email") or token.get("email") or "").strip()
+        if not email_value:
+            raise GmailOAuthError("Google не вернул Gmail-адрес для импортированной авторизации.")
+        if token.get("email") != email_value:
+            token["email"] = email_value
+            self.secret_store.save_gmail_oauth(token)
+        self._audit("gmail_verify_succeeded", email=email_value, client_source=self.client_source)
+        return email_value
 
     async def send_test(self) -> dict[str, Any]:
         self._audit("test_email_requested", configured=self.configured, connected=self.connected)

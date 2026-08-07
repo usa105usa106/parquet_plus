@@ -1,4 +1,4 @@
-# Coolify deployment — v005
+# Coolify deployment — v006
 
 ## Что вводить в Coolify
 
@@ -8,26 +8,27 @@
 TELEGRAM_BOT_TOKEN=123456:...
 ```
 
-Больше вручную в Environment Variables ничего задавать не требуется.
+Остальные значения уже заданы внутри проекта.
 
-## Что делает compose автоматически
+## Порты
 
-- контейнер слушает port `80` для `/healthz` и `/gmail/callback`;
-- `SERVICE_URL_GMAILAUTH_80` — magic environment variable Coolify, поэтому Coolify генерирует публичный URL и проксирует его на container port 80;
-- данные, состояние таймера, Gmail Client ID/Secret, OAuth refresh token и ledger защиты от дублей сохраняются в persistent volumes;
-- ключ шифрования создаётся локально в persistent storage, если внешний ключ не задан;
-- Gmail auto-send включён;
-- лимит Gmail-вложения бота — 24 MB;
-- часовой пояс интерфейса — Europe/Moscow.
+- приложение слушает container port `80`;
+- `/healthz` используется для проверки приложения;
+- `/gmail/callback` нужен только для запасного обычного Google OAuth-flow;
+- `SERVICE_URL_GMAILAUTH_80` позволяет Coolify направить публичный HTTPS URL на container port 80.
 
-## После Deploy
+## Быстрый Gmail import
 
-1. Открыть Telegram-бота и отправить `/start`.
-2. Нажать **Почта** (то же самое, что `/gmail`).
-3. Бот покажет проверку публичного callback Coolify.
-4. После успешной проверки бот покажет точный Google Redirect URI.
-5. В Google Cloud создать OAuth Client типа **Web application** и добавить показанный Redirect URI.
-6. Client ID и Client Secret отправить боту в Telegram по его запросу; сообщения с секретами бот удаляет.
-7. Войти через Google и разрешить `gmail.send`.
+1. Deploy v006.
+2. В Telegram нажать **Почта**.
+3. Отправить одной строкой ранее сохранённый Base64-экспорт Gmail-авторизации старого бота.
+4. Бот сразу удалит сообщение, расшифрует данные в памяти и проверит Google-сессию.
+5. При успехе бот напишет `✅ Почта подключена`.
 
-Для работы Gmail у Coolify должен быть настроен рабочий публичный HTTPS/wildcard domain, из которого magic `SERVICE_URL_*` может создать URL. Сам URL вручную в environment variables вводить не нужно.
+Импортированная Gmail-авторизация работает **только до следующего restart/redeploy**. Она не записывается в `/app/storage` и не попадает в журналы. После redeploy просто повторите импорт той же строки.
+
+## Логи
+
+`/log_full` присылает полный журнал основных операций. Файл `full.log` находится в `/app/storage/logs/` и ротируется. Gmail имеет отдельный `mail.log`.
+
+В логи не пишутся тела секретных сообщений, OAuth access/refresh tokens, Client Secret, Fernet key/token, Bearer Authorization, Telegram bot token и длинные Base64-секреты.

@@ -1,0 +1,20 @@
+{
+  "version": "v006",
+  "date": "2026-08-08",
+  "checks": {
+    "python_compileall": "PASS",
+    "synthetic_gmail_bundle_import": "PASS",
+    "gmail_session_memory_only": "PASS",
+    "gmail_session_gone_after_store_restart": "PASS",
+    "full_log_redaction": "PASS",
+    "mail_log_redaction": "PASS",
+    "version_scan_current_only": "PASS",
+    "live_telegram_market_gmail_integration": "NOT_RUN",
+    "docker_compose_config": "NOT_RUN"
+  },
+  "notes": [
+    "python-telegram-bot and pyarrow are not installed in the current CAAS runtime.",
+    "The internal package mirror did not provide python-telegram-bot==22.8 during this test session.",
+    "No claim of live Binance/MEXC/Gmail integration testing is made."
+  ]
+}

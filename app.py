@@ -24,6 +24,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -41,12 +42,10 @@ from gmail_oauth import (
     GmailSendUncertain,
 )
 from security import SecretStore
+from logging_utils import build_full_log_report, configure_console_logging, enable_full_file_logging
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+configure_console_logging(LOG_LEVEL)
 log = logging.getLogger("market-scan-bot")
 
 BOT_VERSION = APP_VERSION
@@ -65,6 +64,8 @@ BTN_GMAIL_CONFIG = "gmail_config"
 BTN_GMAIL_LOGIN = "gmail_login"
 BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
+BTN_GMAIL_IMPORT = "gmail_import"
+BTN_GMAIL_OAUTH_SETUP = "gmail_oauth_setup"
 
 
 class Runtime:
@@ -75,6 +76,7 @@ class Runtime:
             settings.state_dir,
             settings.secret_encryption_key,
             settings.gmail_backup_root,
+            settings.gmail_session_only,
         )
         self.gmail = GmailOAuthManager(settings, self.secret_store, log)
         self.state = self._load_state()
@@ -84,6 +86,7 @@ class Runtime:
         self.scan_semaphore = asyncio.Semaphore(settings.max_concurrent_scans)
         self.last_scan_started: dict[int, float] = {}
         self.awaiting: dict[int, dict[str, Any]] = {}
+        self.full_log_path = settings.logs_dir / "full.log"
 
     def _load_state(self) -> dict[str, dict[str, Any]]:
         path = self.settings.state_file
@@ -202,6 +205,60 @@ def _allowed(update: Update, runtime: Runtime) -> bool:
     return not ids or chat.id in ids or user.id in ids
 
 
+async def incoming_update_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log every incoming Telegram operation without logging secret message bodies."""
+    runtime = _runtime(context)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _allowed(update, runtime):
+        log.warning("telegram_update rejected update_id=%s chat_id=%s user_id=%s", update.update_id, chat_id, user_id)
+        return
+    if update.callback_query:
+        log.info(
+            "telegram_update callback update_id=%s chat_id=%s user_id=%s data=%s",
+            update.update_id, chat_id, user_id, update.callback_query.data or "",
+        )
+        return
+    message = update.effective_message
+    if message is None:
+        log.info("telegram_update other update_id=%s chat_id=%s user_id=%s", update.update_id, chat_id, user_id)
+        return
+    text = (message.text or "").strip()
+    flow = runtime.awaiting.get(user_id or 0) if user_id is not None else None
+    if flow:
+        log.info(
+            "telegram_update sensitive_input update_id=%s chat_id=%s user_id=%s step=%s chars=%s content=REDACTED",
+            update.update_id, chat_id, user_id, flow.get("step"), len(text),
+        )
+    elif text.startswith("/"):
+        log.info(
+            "telegram_update command update_id=%s chat_id=%s user_id=%s command=%s",
+            update.update_id, chat_id, user_id, text.split(maxsplit=1)[0][:80],
+        )
+    elif text.lower() in {"1", "анализ", "parquet", "отправить parquet", "почта", "подключить почту", "пинг"} or text.lower().startswith("время"):
+        log.info(
+            "telegram_update action update_id=%s chat_id=%s user_id=%s action=%s",
+            update.update_id, chat_id, user_id, text[:80],
+        )
+    else:
+        log.info(
+            "telegram_update text update_id=%s chat_id=%s user_id=%s chars=%s content=NOT_LOGGED",
+            update.update_id, chat_id, user_id, len(text),
+        )
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    update_id = getattr(update, "update_id", None)
+    error = context.error
+    exc_info = (type(error), error, error.__traceback__) if error is not None else None
+    log.error(
+        "telegram_handler_error update_id=%s error_type=%s",
+        update_id,
+        type(error).__name__ if error else "unknown",
+        exc_info=exc_info,
+    )
+
+
 def _keyboard(runtime: Runtime, chat_id: int) -> ReplyKeyboardMarkup:
     label, _ = runtime.mode(chat_id)
     return ReplyKeyboardMarkup(
@@ -276,13 +333,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update, runtime):
         return
     chat_id = update.effective_chat.id
+    log.info("start requested chat_id=%s", chat_id)
     await update.effective_message.reply_text(
         f"Trading + Market Data Bot {BOT_VERSION}\n"
         "Анализ/1: бот сам делает свежий анализ и присылает только финальный вердикт.\n"
         "Parquet: собирает top-100 свечи/данные без выбора LONG/SHORT, отправляет ZIP в Telegram, затем в Gmail.\n"
         "Время: выкл → 15 мин → 30 мин → 1 час → 4 часа; повторяет то действие, которым запущен цикл.\n"
         "Почта: то же, что /gmail.\n"
-        "Пинг: версия/отклик/uptime/RAM. /status — состояние.",
+        "Пинг: версия/отклик/uptime/RAM. /status — состояние. /log_full — полный журнал операций.",
         reply_markup=_keyboard(runtime, chat_id),
     )
 
@@ -292,6 +350,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update, runtime):
         return
     chat_id = update.effective_chat.id
+    log.info("status requested chat_id=%s", chat_id)
     state = runtime.chat_state(chat_id)
     label, interval = runtime.mode(chat_id)
     busy = bool(state.get("scan_busy"))
@@ -353,6 +412,7 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update, runtime):
         return
     chat_id = update.effective_chat.id
+    log.info("ping requested chat_id=%s", chat_id)
     started = time.perf_counter()
     try:
         await context.bot.get_me()
@@ -395,6 +455,7 @@ async def _send_archive_then_gmail(
     result: ArchiveBuildResult,
 ) -> str:
     path = result.archive_path
+    log.info("archive_delivery started chat_id=%s filename=%s size=%s", chat_id, path.name, result.archive_size_bytes)
     if result.archive_size_bytes > runtime.settings.telegram_send_limit_mb * 1024 * 1024:
         raise RuntimeError(
             f"Архив {_human_bytes(result.archive_size_bytes)} превышает лимит Telegram "
@@ -427,15 +488,19 @@ async def _send_archive_then_gmail(
     delivered_name = getattr(getattr(sent, "document", None), "file_name", None) or telegram_name
     if delivered_name != telegram_name:
         raise RuntimeError(f"Telegram изменил имя файла: {delivered_name} != {telegram_name}")
+    log.info("archive_delivery telegram_sent chat_id=%s filename=%s", chat_id, delivered_name)
 
     state = runtime.chat_state(chat_id)
     state["telegram_archives_sent"] = int(state.get("telegram_archives_sent", 0)) + 1
     runtime.save_state()
 
     if not runtime.settings.gmail_auto_send_archives:
+        log.info("archive_delivery gmail_skipped chat_id=%s reason=auto_send_off", chat_id)
         return "AUTO_SEND_OFF"
     if not runtime.gmail.connected:
+        log.info("archive_delivery gmail_skipped chat_id=%s reason=not_connected", chat_id)
         return "NOT_CONNECTED"
+    log.info("archive_delivery gmail_started chat_id=%s filename=%s", chat_id, path.name)
     gmail_result = await runtime.gmail.send_archive(
         path,
         subject_prefix=f"Market Scan {BOT_VERSION}",
@@ -446,6 +511,7 @@ async def _send_archive_then_gmail(
         return f"DUPLICATE:{gmail_result.get('status') or 'unknown'}"
     state["gmail_archives_sent"] = int(state.get("gmail_archives_sent", 0)) + 1
     runtime.save_state()
+    log.info("archive_delivery gmail_sent chat_id=%s filename=%s", chat_id, path.name)
     return "SENT"
 
 
@@ -466,6 +532,7 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
         state = runtime.chat_state(chat_id)
         state["scan_busy"] = True
         started = time.monotonic()
+        log.info("analysis started chat_id=%s show_progress=%s", chat_id, show_progress)
         progress = None
         if show_progress:
             progress = await application.bot.send_message(chat_id=chat_id, text="⏳ Сканирую рынок…")
@@ -512,6 +579,7 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
             state["last_analysis_at"] = finished
             state["last_analysis_duration_seconds"] = duration
             runtime.save_state()
+            log.info("analysis finished chat_id=%s duration_sec=%.3f", chat_id, duration)
 
 
 async def _perform_parquet(application: Application, chat_id: int, *, show_progress: bool) -> None:
@@ -522,6 +590,7 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
         state = runtime.chat_state(chat_id)
         state["scan_busy"] = True
         started = time.monotonic()
+        log.info("parquet started chat_id=%s show_progress=%s", chat_id, show_progress)
         holder: dict[str, Any] = {}
         if show_progress:
             holder["message"] = await application.bot.send_message(chat_id=chat_id, text="⏳ Собираю свежий Parquet без кэша…")
@@ -529,6 +598,7 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
         await runtime.scan_semaphore.acquire()
         try:
             async def progress(text: str) -> None:
+                log.info("parquet progress chat_id=%s stage=%s", chat_id, text)
                 if show_progress:
                     await _progress_message(application, chat_id, text, holder)  # type: ignore[arg-type]
 
@@ -542,6 +612,11 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
             state["last_mexc_funding_coverage"] = result.mexc_funding_coverage
             state["last_commodities_ok_count"] = result.commodities_ok_count
             runtime.save_state()
+            log.info(
+                "parquet archive_built chat_id=%s filename=%s size=%s universe=%s binance_full=%s funding=%s commodities=%s",
+                chat_id, result.archive_path.name, result.archive_size_bytes, result.universe_count,
+                result.binance_full_count, result.mexc_funding_coverage, result.commodities_ok_count,
+            )
 
             await _safe_delete(holder.get("message"))
             gmail_status = await _send_archive_then_gmail(application, chat_id, runtime, result)  # type: ignore[arg-type]
@@ -591,6 +666,7 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
             state["last_parquet_at"] = finished
             state["last_parquet_duration_seconds"] = duration
             runtime.save_state()
+            log.info("parquet finished chat_id=%s duration_sec=%.3f", chat_id, duration)
 
 
 def _cancel_auto(runtime: Runtime, chat_id: int) -> None:
@@ -614,6 +690,7 @@ def _schedule_auto(application: Application, chat_id: int) -> None:
     if existing is not None and not existing.done():
         return
     runtime.auto_tasks[chat_id] = asyncio.create_task(_auto_loop(application, chat_id), name=f"auto-action-{chat_id}")
+    log.info("timer scheduled chat_id=%s interval_sec=%s action=%s", chat_id, seconds, state.get("auto_action"))
 
 
 async def _auto_loop(application: Application, chat_id: int) -> None:
@@ -627,6 +704,7 @@ async def _auto_loop(application: Application, chat_id: int) -> None:
                 return
             last = state.get("last_completed_at")
             delay = max(0.0, float(last) + interval - time.time()) if isinstance(last, (int, float)) else float(interval)
+            log.info("timer waiting chat_id=%s delay_sec=%.3f action=%s", chat_id, delay, action)
             await asyncio.sleep(delay)
             state = runtime.chat_state(chat_id)
             _, interval = runtime.mode(chat_id)
@@ -634,6 +712,7 @@ async def _auto_loop(application: Application, chat_id: int) -> None:
             if not state.get("armed") or interval <= 0 or action not in {"analysis", "parquet"}:
                 return
             runtime.auto_scanning.add(chat_id)
+            log.info("timer triggered chat_id=%s action=%s", chat_id, action)
             try:
                 if action == "analysis":
                     await _perform_analysis(application, chat_id, show_progress=False)
@@ -702,6 +781,7 @@ async def time_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Бот будет повторять именно выбранное действие; новый интервал отсчитывается после полного завершения предыдущего запуска."
         )
     runtime.save_state()
+    log.info("timer mode_changed chat_id=%s label=%s interval_sec=%s", chat_id, label, seconds)
     await update.effective_message.reply_text(text, reply_markup=_keyboard(runtime, chat_id))
 
 
@@ -720,26 +800,43 @@ async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _allowed(update, runtime):
         return
     chat_id = update.effective_chat.id
-    if not runtime.settings.gmail_public_base_url:
-        await update.effective_message.reply_text(
-            "❌ Coolify public URL для Gmail callback не найден. Используй сервис с public HTTPS URL, который ведёт на container port 80."
-        )
-        return
     if runtime.gmail.connected:
         await update.effective_message.reply_text(
             f"✅ Gmail подключён: {runtime.gmail.account_email}\n"
             f"Автоотправка: {'ON' if runtime.settings.gmail_auto_send_archives else 'OFF'}\n"
+            f"Режим авторизации: {'до следующего redeploy' if runtime.settings.gmail_session_only else 'постоянный'}\n"
             "Архив сначала уходит в Telegram как обычный .zip, затем теми же ZIP-байтами — в Gmail как .zip.jpg.",
             reply_markup=_gmail_connected_menu(runtime),
+        )
+        return
+
+    if update.effective_user:
+        runtime.awaiting[update.effective_user.id] = {"step": "gmail_import_bundle"}
+    log.info("Gmail session import requested chat_id=%s", chat_id)
+    buttons = []
+    if runtime.settings.gmail_public_base_url:
+        buttons.append([InlineKeyboardButton("🔐 Обычное OAuth-подключение", callback_data=BTN_GMAIL_OAUTH_SETUP)])
+    await update.effective_message.reply_text(
+        "📥 Отправь сюда одной строкой экспорт Gmail-авторизации из старого бота.\n"
+        "Сообщение со строкой бот сразу удалит. Авторизация действует до следующего redeploy.\n"
+        "/cancel — отмена.",
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
+
+
+async def _gmail_oauth_setup(message: Any, runtime: Runtime, chat_id: int) -> None:
+    if not runtime.settings.gmail_public_base_url:
+        await message.reply_text(
+            "❌ Coolify public URL для Gmail callback не найден. Используй сервис с public HTTPS URL, который ведёт на container port 80."
         )
         return
     if not runtime.gmail.is_health_probe_confirmed(chat_id):
         try:
             probe_url = runtime.gmail.create_health_probe_url(chat_id)
         except GmailOAuthError as exc:
-            await update.effective_message.reply_text(f"❌ Gmail callback: {exc}")
+            await message.reply_text(f"❌ Gmail callback: {exc}")
             return
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Сначала проверим внешний callback Coolify:\n1) открой ссылку; 2) вернись и нажми Проверить результат.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🌐 1. Открыть проверку сервера", url=probe_url)],
@@ -747,7 +844,7 @@ async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ]),
         )
         return
-    await _gmail_ready(update.effective_message, runtime, chat_id)
+    await _gmail_ready(message, runtime, chat_id)
 
 
 async def _gmail_ready(message: Any, runtime: Runtime, chat_id: int) -> None:
@@ -786,6 +883,18 @@ async def gmail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     chat_id = update.effective_chat.id
     data = query.data
+    if data == BTN_GMAIL_IMPORT:
+        if update.effective_user:
+            runtime.awaiting[update.effective_user.id] = {"step": "gmail_import_bundle"}
+        await query.message.reply_text(
+            "Отправь строку экспорта Gmail-авторизации одним сообщением. Я сразу удалю её. /cancel — отмена."
+        )
+        return
+    if data == BTN_GMAIL_OAUTH_SETUP:
+        if update.effective_user:
+            runtime.awaiting.pop(update.effective_user.id, None)
+        await _gmail_oauth_setup(query.message, runtime, chat_id)
+        return
     if data == BTN_GMAIL_CHECK:
         if runtime.gmail.is_health_probe_confirmed(chat_id):
             await _gmail_ready(query.message, runtime, chat_id)
@@ -821,7 +930,7 @@ async def gmail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if data == BTN_GMAIL_DISCONNECT:
         runtime.gmail.disconnect()
-        await query.message.reply_text("Gmail отключён. Client ID/Secret сохранены; OAuth можно подключить заново через /gmail.")
+        await query.message.reply_text("Gmail отключён. Для быстрого подключения снова нажми «Почта» и отправь строку импорта.")
         return
 
 
@@ -829,6 +938,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     runtime = _runtime(context)
     if update.effective_user:
         runtime.awaiting.pop(update.effective_user.id, None)
+    log.info("interactive flow cancelled chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await update.effective_message.reply_text("Отменено.")
 
 
@@ -845,6 +955,26 @@ async def log_mail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f"❌ log_mail: {exc}")
 
 
+async def log_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = _runtime(context)
+    if not _allowed(update, runtime):
+        return
+    chat_id = update.effective_chat.id
+    log.info("full_log requested chat_id=%s", chat_id)
+    try:
+        report = await asyncio.to_thread(
+            build_full_log_report,
+            runtime.full_log_path,
+            runtime.settings.exports_dir,
+        )
+        with report.open("rb") as fh:
+            await context.bot.send_document(chat_id=chat_id, document=fh, filename=report.name)
+        log.info("full_log sent chat_id=%s filename=%s size=%s", chat_id, report.name, report.stat().st_size)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("full_log failed chat_id=%s", chat_id)
+        await update.effective_message.reply_text(f"❌ log_full: {type(exc).__name__}")
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     runtime = _runtime(context)
     if not _allowed(update, runtime):
@@ -858,6 +988,38 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.effective_message.delete()
         except Exception:
             pass
+        if step == "gmail_import_bundle":
+            log.info(
+                "Gmail session import payload received chat_id=%s user_id=%s chars=%s content=REDACTED",
+                update.effective_chat.id,
+                user.id,
+                len(text),
+            )
+            try:
+                runtime.secret_store.import_gmail_runtime_bundle(text)
+                email_value = await runtime.gmail.verify_connection()
+                runtime.awaiting.pop(user.id, None)
+                log.info("Gmail session import verified chat_id=%s email=%s", update.effective_chat.id, email_value)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=(
+                        f"✅ Почта подключена: {email_value}\n"
+                        "Авторизация хранится только в текущей сессии и исчезнет после redeploy."
+                    ),
+                    reply_markup=_keyboard(runtime, update.effective_chat.id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                runtime.secret_store.clear_runtime_gmail()
+                log.warning(
+                    "Gmail session import failed chat_id=%s error_type=%s",
+                    update.effective_chat.id,
+                    type(exc).__name__,
+                )
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"❌ Импорт Gmail не принят: {str(exc)[:300]}\nОтправь строку ещё раз или /cancel.",
+                )
+            return
         if step == "gmail_client_id":
             try:
                 client_id = runtime.gmail.validate_client_id(text)
@@ -927,6 +1089,8 @@ def main() -> None:
     settings = load_settings()
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
+    full_log_path = enable_full_file_logging(settings.logs_dir, LOG_LEVEL)
+    log.info("Full operation logging enabled path=%s", full_log_path)
     runtime = Runtime(settings)
     app = (
         Application.builder()
@@ -936,6 +1100,7 @@ def main() -> None:
         .build()
     )
     app.bot_data["runtime"] = runtime
+    app.add_handler(TypeHandler(Update, incoming_update_audit), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("scan", analysis))
@@ -943,10 +1108,12 @@ def main() -> None:
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("gmail", gmail_command))
     app.add_handler(CommandHandler("log_mail", log_mail))
+    app.add_handler(CommandHandler("log_full", log_full))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(gmail_callback, pattern="^gmail_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    log.info("Trading + Market Data Bot started version=%s", BOT_VERSION)
+    app.add_error_handler(telegram_error_handler)
+    log.info("Trading + Market Data Bot started version=%s gmail_session_only=%s", BOT_VERSION, settings.gmail_session_only)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

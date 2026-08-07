@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import io
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +18,15 @@ class SecretStore:
         state_dir: Path,
         env_key: str | None = None,
         backup_root: Path | None = None,
+        gmail_session_only: bool = False,
     ):
         self.secrets_dir = secrets_dir
         self.state_dir = state_dir
         self.backup_root = Path(backup_root) if backup_root else None
+        self.gmail_session_only = bool(gmail_session_only)
+        self._runtime_gmail_client: dict[str, Any] | None = None
+        self._runtime_gmail_oauth: dict[str, Any] | None = None
+        self._runtime_gmail_imported = False
         self.backup_secrets_dir = self.backup_root / "secrets" if self.backup_root else None
         self.backup_state_dir = self.backup_root / "state" if self.backup_root else None
         self.backup_bundle_file = self.backup_root / "gmail_bundle_backup.json" if self.backup_root else None
@@ -40,10 +47,11 @@ class SecretStore:
         # If a deployment created an empty primary bind directory, recover the
         # complete Gmail encryption bundle from the redundant named volume
         # before a new key can be generated.
-        self.recovered_from_backup = self._restore_gmail_bundle_from_backup_if_needed()
+        self.recovered_from_backup = False if self.gmail_session_only else self._restore_gmail_bundle_from_backup_if_needed()
         self.fernet = Fernet(self._load_or_create_key(env_key))
         self._touch_storage_identity()
-        self._mirror_gmail_bundle_to_backup()
+        if not self.gmail_session_only:
+            self._mirror_gmail_bundle_to_backup()
 
     def _read_json_file(self, path: Path) -> Any | None:
         if not path.exists():
@@ -60,7 +68,7 @@ class SecretStore:
         single JSON rename. This avoids a crash leaving the backup key from one
         generation and ciphertext from another generation.
         """
-        if not self.backup_bundle_file or not self.key_file.exists():
+        if self.gmail_session_only or not self.backup_bundle_file or not self.key_file.exists():
             return
         try:
             payload = {
@@ -197,7 +205,9 @@ class SecretStore:
                 payload = {}
         except Exception:
             payload = {}
-        payload["backup_bundle_ok"] = bool(self.backup_bundle_file and self.backup_bundle_file.is_file())
+        payload["backup_bundle_ok"] = bool((not self.gmail_session_only) and self.backup_bundle_file and self.backup_bundle_file.is_file())
+        payload["gmail_session_only"] = self.gmail_session_only
+        payload["gmail_runtime_imported"] = self._runtime_gmail_imported
         return payload
 
     @staticmethod
@@ -342,25 +352,116 @@ class SecretStore:
     def load_mexc_api(self) -> dict | None:
         return self._load_encrypted(self.api_file)
 
+    @property
+    def gmail_runtime_imported(self) -> bool:
+        return bool(self._runtime_gmail_imported)
+
+    def clear_runtime_gmail(self) -> None:
+        self._runtime_gmail_client = None
+        self._runtime_gmail_oauth = None
+        self._runtime_gmail_imported = False
+
+    def import_gmail_runtime_bundle(self, encoded_bundle: str) -> dict[str, Any]:
+        """Import the old bot's Gmail bundle into memory only.
+
+        Expected input is the Base64 output of a tar.gz containing exactly the
+        old encrypted Gmail client, OAuth token and the matching Fernet key.
+        Nothing from this payload is written to disk, so it disappears on
+        process/container restart.
+        """
+        compact = "".join((encoded_bundle or "").split())
+        if not compact:
+            raise ValueError("пустая строка импорта")
+        if len(compact) > 256 * 1024:
+            raise ValueError("строка импорта слишком большая")
+        try:
+            raw = base64.b64decode(compact, validate=True)
+        except Exception as exc:
+            raise ValueError("строка импорта не является корректным Base64") from exc
+
+        expected = {
+            "secrets/gmail_client.enc.json",
+            "secrets/gmail_oauth.enc.json",
+            "state/fernet.key",
+        }
+        extracted: dict[str, bytes] = {}
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+                members = {member.name.lstrip("./"): member for member in archive.getmembers() if member.isfile()}
+                missing = expected - set(members)
+                if missing:
+                    raise ValueError("в архиве не хватает файлов Gmail-авторизации")
+                for name in expected:
+                    member_file = archive.extractfile(members[name])
+                    if member_file is None:
+                        raise ValueError("не удалось прочитать файл из архива")
+                    extracted[name] = member_file.read()
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("не удалось открыть архив авторизации") from exc
+
+        try:
+            imported_key = self._coerce_fernet_key(extracted["state/fernet.key"])
+            imported_fernet = Fernet(imported_key)
+            client_record = json.loads(extracted["secrets/gmail_client.enc.json"].decode("utf-8"))
+            oauth_record = json.loads(extracted["secrets/gmail_oauth.enc.json"].decode("utf-8"))
+            client_plain = imported_fernet.decrypt(str(client_record["encrypted"]).encode("utf-8"))
+            oauth_plain = imported_fernet.decrypt(str(oauth_record["encrypted"]).encode("utf-8"))
+            client = json.loads(client_plain.decode("utf-8"))
+            oauth = json.loads(oauth_plain.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("ключ не подходит к Gmail-файлам или данные повреждены") from exc
+
+        if not isinstance(client, dict) or not isinstance(oauth, dict):
+            raise ValueError("неверный формат Gmail-авторизации")
+        client_id = str(client.get("client_id") or "").strip()
+        client_secret = str(client.get("client_secret") or "").strip()
+        refresh_token = str(oauth.get("refresh_token") or "").strip()
+        email = str(oauth.get("email") or "").strip()
+        if not client_id.endswith(".apps.googleusercontent.com") or not client_secret:
+            raise ValueError("в импорте нет корректного Google OAuth Client")
+        if not refresh_token or not email:
+            raise ValueError("в импорте нет refresh token или Gmail-адреса")
+
+        self._runtime_gmail_client = dict(client)
+        self._runtime_gmail_oauth = dict(oauth)
+        self._runtime_gmail_imported = True
+        return {
+            "email": email,
+            "client_id_mask": self.mask(client_id),
+            "session_only": True,
+        }
+
     def save_gmail_client(self, client_id: str, client_secret: str) -> dict[str, str]:
         payload = {
             "client_id": client_id.strip(),
             "client_secret": client_secret.strip(),
         }
-        return self._save_encrypted(
-            self.gmail_client_file,
-            payload,
-            {
-                "client_id": self.mask(payload["client_id"]),
-                "client_secret": self.mask(payload["client_secret"]),
-            },
-        )
+        mask = {
+            "client_id": self.mask(payload["client_id"]),
+            "client_secret": self.mask(payload["client_secret"]),
+        }
+        if self.gmail_session_only or self._runtime_gmail_imported:
+            self._runtime_gmail_client = payload
+            self._runtime_gmail_imported = False
+            return mask
+        return self._save_encrypted(self.gmail_client_file, payload, mask)
 
     def load_gmail_client(self) -> dict[str, Any] | None:
+        if self._runtime_gmail_client is not None:
+            return dict(self._runtime_gmail_client)
+        if self.gmail_session_only:
+            return None
         return self._load_encrypted(self.gmail_client_file)
 
     def load_gmail_client_mask(self) -> dict[str, str] | None:
-        if not self.gmail_client_file.exists():
+        if self._runtime_gmail_client is not None:
+            return {
+                "client_id": self.mask(str(self._runtime_gmail_client.get("client_id") or "")),
+                "client_secret": self.mask(str(self._runtime_gmail_client.get("client_secret") or "")),
+            }
+        if self.gmail_session_only or not self.gmail_client_file.exists():
             return None
         try:
             data = json.loads(self.gmail_client_file.read_text(encoding="utf-8"))
@@ -370,11 +471,18 @@ class SecretStore:
         return mask if isinstance(mask, dict) else None
 
     def clear_gmail_client(self) -> None:
+        self._runtime_gmail_client = None
+        self._runtime_gmail_imported = False
+        if self.gmail_session_only:
+            return
         if self.gmail_client_file.exists():
             self.gmail_client_file.unlink()
         self._delete_backup_file(self.gmail_client_file)
 
     def save_gmail_oauth(self, payload: dict) -> None:
+        if self.gmail_session_only or self._runtime_gmail_imported or self._runtime_gmail_client is not None:
+            self._runtime_gmail_oauth = dict(payload)
+            return
         self._save_encrypted(
             self.gmail_file,
             payload,
@@ -382,9 +490,17 @@ class SecretStore:
         )
 
     def load_gmail_oauth(self) -> dict | None:
+        if self._runtime_gmail_oauth is not None:
+            return dict(self._runtime_gmail_oauth)
+        if self.gmail_session_only:
+            return None
         return self._load_encrypted(self.gmail_file)
 
     def clear_gmail_oauth(self) -> None:
+        self._runtime_gmail_oauth = None
+        self._runtime_gmail_imported = False
+        if self.gmail_session_only:
+            return
         if self.gmail_file.exists():
             self.gmail_file.unlink()
         self._delete_backup_file(self.gmail_file)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-APP_VERSION = "v005"
+APP_VERSION = "v006"
 
 
 def _normalize_public_base_url(value: str) -> str:
@@ -88,6 +88,7 @@ class Settings:
     gmail_oauth_listen_host: str
     gmail_oauth_listen_port: int
     gmail_backup_root: Path | None
+    gmail_session_only: bool
     app_version: str
 
     def ensure_dirs(self) -> None:
@@ -156,6 +157,7 @@ def load_settings() -> Settings:
         gmail_oauth_listen_host=os.getenv("GMAIL_OAUTH_LISTEN_HOST", "0.0.0.0").strip() or "0.0.0.0",
         gmail_oauth_listen_port=int(os.getenv("GMAIL_OAUTH_LISTEN_PORT", "80")),
         gmail_backup_root=backup_root,
+        gmail_session_only=os.getenv("GMAIL_SESSION_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"},
         app_version=APP_VERSION,
     )
     settings.ensure_dirs()
