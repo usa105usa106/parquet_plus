@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="Coolify Trading + Market Data Bot" \
-      org.opencontainers.image.version="v007"
+      org.opencontainers.image.version="v008"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

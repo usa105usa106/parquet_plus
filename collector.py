@@ -20,19 +20,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config import Settings
+from asset_filters import is_excluded_asset
 
 log = logging.getLogger(__name__)
 
-# Market-cap entries that should not consume one of the 100 analysis slots.
-# The goal is 100 independently tradable crypto assets on Binance Spot, not
-# stablecoins or tokenized/wrapped duplicates of another asset.
-EXCLUDED_BASES = {
-    "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDS", "PYUSD", "USDE", "USDF", "USD1",
-    "FRAX", "LUSD", "GUSD", "SUSD", "USDD", "USDP", "EUR", "EURI", "AEUR",
-    "WBTC", "WETH", "STETH", "WSTETH", "WEETH", "WBETH", "CBETH", "RETH", "EZETH",
-    "WBNB", "JITOSOL", "MSOL", "BNSOL", "SOLVBTC", "LBTC", "CBBTC", "TBTC", "RSETH",
-    "SUSDE", "SUSDS", "BUIDL", "USYC", "USDTB",
-}
+# Stablecoin/wrapped filtering is centralized in asset_filters.py.
 
 # Market-cap provider aliases -> Binance Spot base asset.
 BASE_ALIASES = {
@@ -224,7 +216,7 @@ def _select_top100(
     seen_pairs: set[str] = set()
     for coin in sorted(candidates, key=lambda x: int(x.get("rank") or 999999)):
         symbol = str(coin.get("symbol") or "").upper()
-        if not symbol or symbol in EXCLUDED_BASES:
+        if not symbol or is_excluded_asset(symbol, str(coin.get("name") or ""), coin.get("provider_id")):
             continue
         base = BASE_ALIASES.get(symbol, symbol)
         pair = spot_pairs.get(base)

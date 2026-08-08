@@ -1,0 +1,11 @@
+{
+  "version": "v008",
+  "compileall": "ok",
+  "version_sweep": "ok",
+  "stablecoin_filter_synthetic_cases": 25,
+  "stablecoin_filter_synthetic": "ok",
+  "wrapped_tokenized_filter": "ok",
+  "partial_history_allowed": true,
+  "strict_999_required": false,
+  "live_external_api_test": "not_run"
+}

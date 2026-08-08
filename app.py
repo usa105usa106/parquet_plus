@@ -63,7 +63,7 @@ BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
 
-# Callback ids from older builds. v007 never launches OAuth/callback setup.
+# Callback ids from older builds. v008 never launches OAuth/callback setup.
 STALE_GMAIL_CALLBACKS = {
     "gmail_check",
     "gmail_config",

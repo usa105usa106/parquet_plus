@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v007
+# Coolify Trading Signal Bot v008
 
 import math
 import time
@@ -9,7 +9,7 @@ from typing import Any
 
 from analyzer import Signal
 
-BOT_VERSION = "v007"
+BOT_VERSION = "v008"
 SIGNAL_HORIZON_SECONDS = 14 * 24 * 60 * 60
 
 OPEN_STATES = {"pending", "active"}
@@ -18,7 +18,7 @@ INACTIVE_STATES = {"expired", "superseded"}
 
 
 def ensure_stats(raw: Any) -> dict[str, Any]:
-    """Return a JSON-safe v007 stats object, preserving compatible records."""
+    """Return a JSON-safe v008 stats object, preserving compatible records."""
     if not isinstance(raw, dict):
         raw = {}
     records = raw.get("records")

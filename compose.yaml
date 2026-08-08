@@ -18,7 +18,7 @@ services:
       - GMAIL_OAUTH_LISTEN_PORT=80
       - GMAIL_SESSION_ONLY=true
 
-      # Gmail в v007 подключается только импортом сохранённой сессии через Telegram.
+      # Gmail в v008 подключается только импортом сохранённой сессии через Telegram.
       # Public callback/Google OAuth redirect URI не используется.
     expose:
       - "80"

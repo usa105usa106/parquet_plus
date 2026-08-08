@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v007
+# Coolify Trading Signal Bot v008
 
 import asyncio
 import logging
@@ -15,6 +15,8 @@ from urllib.parse import quote_plus
 
 import httpx
 
+from asset_filters import is_excluded_asset
+
 log = logging.getLogger(__name__)
 
 BINANCE_SPOT_BASE = os.getenv("BINANCE_SPOT_BASE_URL", "https://api.binance.com").rstrip("/")
@@ -28,11 +30,7 @@ GOOGLE_NEWS_RSS = os.getenv("GOOGLE_NEWS_RSS_URL", "https://news.google.com/rss/
 HTTP_TIMEOUT = float(os.getenv("MARKET_HTTP_TIMEOUT", "25"))
 ENABLE_NEWS_FILTER = os.getenv("ENABLE_NEWS_FILTER", "true").lower() in {"1", "true", "yes", "on"}
 
-STABLE_OR_WRAPPED = {
-    "USDT", "USDC", "DAI", "USDS", "FDUSD", "TUSD", "PYUSD", "USDE", "USDF",
-    "FRAX", "LUSD", "GUSD", "SUSD", "USDD", "WBTC", "WETH", "STETH", "WSTETH",
-    "WEETH", "WBETH", "CBETH", "RETH", "EZETH", "BUIDL", "USYC", "USDTB",
-}
+# Stablecoin/wrapped filtering is centralized in asset_filters.py.
 
 # Spot ticker aliases where market-cap source and Binance use different symbols.
 SPOT_ALIASES = {
@@ -216,13 +214,18 @@ def _technical_from_rows(rows: list[list[Any]], interval: str) -> dict[str, Any]
 def _coinpaprika_top100(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     ranked = sorted((row for row in rows if isinstance(row, dict)), key=lambda x: int(x.get("rank") or 999999))
-    for row in ranked[:100]:
+    for row in ranked:
+        symbol = str(row.get("symbol") or "").upper()
+        name = str(row.get("name") or row.get("symbol") or "")
+        provider_id = row.get("id")
+        if is_excluded_asset(symbol, name, provider_id):
+            continue
         q = (row.get("quotes") or {}).get("USD") or {}
         result.append({
             "id": row.get("id"),
             "rank": int(row.get("rank") or 0),
-            "symbol": str(row.get("symbol") or "").upper(),
-            "name": str(row.get("name") or row.get("symbol") or ""),
+            "symbol": symbol,
+            "name": name,
             "price": _f(q.get("price"), 0.0) or 0.0,
             "change_24h_pct": _f(q.get("percent_change_24h"), 0.0) or 0.0,
             "change_7d_pct": _f(q.get("percent_change_7d"), 0.0) or 0.0,
@@ -232,6 +235,8 @@ def _coinpaprika_top100(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "total_supply": _f(row.get("total_supply"), None),
             "max_supply": _f(row.get("max_supply"), None),
         })
+        if len(result) == 100:
+            break
     return result
 
 
@@ -239,12 +244,17 @@ def _coinpaprika_top100(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _coingecko_top100(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for row in rows[:100]:
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        name = str(row.get("name") or row.get("symbol") or "")
+        provider_id = row.get("id")
+        if is_excluded_asset(symbol, name, provider_id):
+            continue
         result.append({
             "id": row.get("id"),
             "rank": int(row.get("market_cap_rank") or 0),
-            "symbol": str(row.get("symbol") or "").upper(),
-            "name": str(row.get("name") or row.get("symbol") or ""),
+            "symbol": symbol,
+            "name": name,
             "price": _f(row.get("current_price"), 0.0) or 0.0,
             "change_24h_pct": _f(row.get("price_change_percentage_24h"), 0.0) or 0.0,
             "change_7d_pct": _f(row.get("price_change_percentage_7d_in_currency"), 0.0) or 0.0,
@@ -254,6 +264,8 @@ def _coingecko_top100(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "total_supply": _f(row.get("total_supply"), None),
             "max_supply": _f(row.get("max_supply"), None),
         })
+        if len(result) == 100:
+            break
     return result
 
 
@@ -278,7 +290,7 @@ async def _fetch_universe(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
     # Free/no-key fallback. It is intentionally a fallback so the normal scan does not hit both services.
     markets, global_raw = await asyncio.gather(
         _get_json(client, f"{COINGECKO_BASE}/coins/markets", params={
-            "vs_currency": "usd", "order": "market_cap_desc", "per_page": 100, "page": 1,
+            "vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1,
             "sparkline": "false", "price_change_percentage": "24h,7d",
         }),
         _get_json(client, f"{COINGECKO_BASE}/global"),
@@ -305,7 +317,7 @@ def _pre_score_crypto(
     scored: list[tuple[str, float, float]] = []
     for coin in top100:
         symbol = coin["symbol"]
-        if symbol in STABLE_OR_WRAPPED or symbol not in spot_map:
+        if is_excluded_asset(symbol, str(coin.get("name") or ""), coin.get("id")) or symbol not in spot_map:
             continue
         ticker = spot_tickers.get(spot_map[symbol], {})
         spot_volume = _f(ticker.get("quoteVolume"), 0.0) or 0.0
@@ -361,7 +373,7 @@ async def _fetch_mexc_derivatives(
     """Fetch MEXC perpetual funding in one public/no-auth request.
 
     MEXC's all-contract ticker includes fundingRate, 24h move/turnover and holdVol.
-    In v007 MEXC is the only funding source; Binance Futures is not queried.
+    In v008 MEXC is the only funding source; Binance Futures is not queried.
     """
     try:
         payload = await _get_json(
@@ -422,7 +434,7 @@ async def _fetch_derivatives(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Fetch derivatives context from MEXC only.
 
-    Funding is intentionally MEXC-only in v007. Binance Futures is not called at
+    Funding is intentionally MEXC-only in v008. Binance Futures is not called at
     all, so an unavailable Binance Futures API cannot delay or alter the scan.
     """
     mexc_rows, mexc_status = await _fetch_mexc_derivatives(client, symbols)
@@ -595,7 +607,7 @@ async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
 async def fetch_market_bundle() -> dict[str, Any]:
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v007)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v008)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
@@ -749,7 +761,7 @@ def _history_bars_from_yahoo(payload: dict[str, Any], now_ts: float) -> list[dic
 
 
 async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Fetch lightweight 1H history for v007 signal statistics.
+    """Fetch lightweight 1H history for v008 signal statistics.
 
     Crypto outcomes are measured on Binance Spot only. Commodity outcomes use
     the exact Yahoo symbol that generated the published setup. No Futures API is
@@ -767,7 +779,7 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
     now_ms = int(now_ts * 1000)
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v007)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v008)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     sem = asyncio.Semaphore(6)

@@ -392,7 +392,7 @@ class GmailOAuthManager:
         if self._runner is not None:
             self._audit("health_server_already_started")
             return
-        # v007 uses Gmail session import only. Port 80 remains solely for
+        # v008 uses Gmail session import only. Port 80 remains solely for
         # Docker/Coolify health checks; the Google OAuth callback route is not
         # registered at all.
         app = web.Application(client_max_size=1024 * 1024)
