@@ -3,3 +3,4 @@ httpx==0.28.1
 aiohttp>=3.11,<4
 cryptography>=44,<48
 pyarrow>=18,<24
+beautifulsoup4>=4.12,<5

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v017
+# Coolify Trading Signal Bot v019
 
 import asyncio
 import logging
@@ -8,13 +8,15 @@ import math
 import os
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from statistics import mean, median
 from typing import Any
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import httpx
+from bs4 import BeautifulSoup
 
 from asset_filters import is_excluded_asset
 
@@ -25,7 +27,7 @@ MEXC_CONTRACT_BASE = os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.com")
 COINPAPRIKA_BASE = os.getenv("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1").rstrip("/")
 COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3").rstrip("/")
 FF_CAL_THIS_WEEK = os.getenv("FF_CAL_THIS_WEEK_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
-FF_CAL_NEXT_WEEK = os.getenv("FF_CAL_NEXT_WEEK_URL", "https://nfs.faireconomy.media/ff_calendar_nextweek.json")
+FF_CAL_NEXT_WEEK_PAGE = os.getenv("FF_CAL_NEXT_WEEK_PAGE_URL", "https://www.forexfactory.com/calendar?week=next")
 GOOGLE_NEWS_RSS = os.getenv("GOOGLE_NEWS_RSS_URL", "https://news.google.com/rss/search")
 HTTP_TIMEOUT = float(os.getenv("MARKET_HTTP_TIMEOUT", "25"))
 ENABLE_NEWS_FILTER = os.getenv("ENABLE_NEWS_FILTER", "true").lower() in {"1", "true", "yes", "on"}
@@ -44,7 +46,7 @@ COMMODITY_SYMBOLS = {
     "USOIL": "USOIL_USDT",
 }
 
-# v017 local commodity candles come directly from MEXC Futures. DXY/US10Y are
+# v019 local commodity candles come directly from MEXC Futures. DXY/US10Y are
 # not fetched locally; the crypto regime remains based on broad crypto data and BTC dominance.
 
 IMPORTANT_EVENT_KEYWORDS = (
@@ -178,7 +180,7 @@ def rsi(values: list[float], period: int = 14) -> float | None:
 
 
 def _technical_from_rows(rows: list[list[Any]], interval: str) -> dict[str, Any]:
-    # v017: keep younger listings usable instead of requiring a full 365D
+    # v019: keep younger listings usable instead of requiring a full 365D
     # history. Twenty-one closed bars are enough for a cautious partial view;
     # EMA50/EMA200 simply remain unavailable until enough history exists.
     if len(rows) < 21:
@@ -377,7 +379,7 @@ async def _fetch_binance_spot_details(
 ) -> dict[str, dict[str, Any]]:
     """Fetch closed Binance Spot candles for the local analyzer.
 
-    v017 requests up to 365 closed 1D candles and 288 closed 15m candles.
+    v019 requests up to 365 closed 1D candles and 288 closed 15m candles.
     A shorter 1D history is retained as PARTIAL_HISTORY; it is never rejected
     merely because the listing is younger than 365 days. 15m is optional: if
     that single request fails the 1D/4H/1H core remains usable.
@@ -528,7 +530,7 @@ async def _fetch_mexc_derivatives(
     """Fetch MEXC perpetual funding in one public/no-auth request.
 
     MEXC's all-contract ticker includes fundingRate, 24h move/turnover and holdVol.
-    In v017 MEXC is the only funding source; Binance Futures is not queried.
+    In v019 MEXC is the only funding source; Binance Futures is not queried.
     """
     try:
         payload = await _get_json(
@@ -592,15 +594,18 @@ async def _fetch_mexc_derivatives(
 async def _fetch_derivatives(
     client: httpx.AsyncClient,
     symbols: list[str],
+    *,
+    funding_symbols: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Fetch derivatives context from MEXC only.
 
-    Funding is intentionally MEXC-only in v017. Binance Futures is not called at
+    Funding is intentionally MEXC-only in v019. Binance Futures is not called at
     all, so an unavailable Binance Futures API cannot delay or alter the scan.
     """
     mexc_rows, mexc_status = await _fetch_mexc_derivatives(client, symbols)
+    funding_check = funding_symbols if funding_symbols is not None else symbols
     funding_status = "mexc" if any(
-        (mexc_rows.get(symbol) or {}).get("funding_pct") is not None for symbol in symbols
+        (mexc_rows.get(symbol) or {}).get("funding_pct") is not None for symbol in funding_check
     ) else "unavailable"
     return mexc_rows, {
         "funding": funding_status,
@@ -665,7 +670,7 @@ async def _fetch_mexc_commodity_asset(
 ) -> tuple[str, dict[str, Any]]:
     """Fetch native closed MEXC Futures candles for XAU/XAG/USOIL.
 
-    No alternate chart-provider fallback is used in v017. 1D is retained up to 365 bars, native 4H
+    No alternate chart-provider fallback is used in v019. 1D is retained up to 365 bars, native 4H
     and 1H are used directly, and 15m is best-effort entry confirmation.
     """
     now_ms = int(time.time() * 1000)
@@ -767,17 +772,135 @@ async def _fetch_news_score(client: httpx.AsyncClient, query: str) -> dict[str, 
         return {"score": 0.0, "titles": [], "status": f"unavailable:{type(exc).__name__}"}
 
 
+def _closest_calendar_date(date_text: str, reference: datetime) -> datetime | None:
+    """Resolve 'Sun Aug 16' to the year closest to the next-week reference."""
+    clean = " ".join(str(date_text).split())
+    for year in (reference.year - 1, reference.year, reference.year + 1):
+        try:
+            candidate = datetime.strptime(f"{clean} {year}", "%a %b %d %Y")
+        except ValueError:
+            continue
+        if abs((candidate.date() - reference.date()).days) <= 200:
+            return candidate
+    return None
+
+
+def _ff_impact(cell: Any) -> str:
+    if cell is None:
+        return ""
+    classes: list[str] = []
+    for tag in [cell, *cell.find_all(True)]:
+        classes.extend(str(x) for x in (tag.get("class") or []))
+    joined = " ".join(classes).lower()
+    if "impact-red" in joined:
+        return "High"
+    if "impact-ora" in joined:
+        return "Medium"
+    if "impact-gra" in joined:
+        return "Low"
+    if "impact-yel" in joined:
+        return "Non-economic"
+    return ""
+
+
+def _parse_forex_factory_next_week_html(html_text: str, *, now: datetime | None = None) -> list[dict[str, Any]]:
+    """Parse the public Forex Factory next-week HTML page into JSON-like rows.
+
+    The public weekly JSON export only covers 'this week'; Forex Factory's
+    next-week page is therefore used as a failsafe for the 3–14 day horizon.
+    The page-advertised IANA timezone is parsed and converted to UTC.
+    """
+    now = now or datetime.now(timezone.utc)
+    soup = BeautifulSoup(html_text, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
+    tz_match = __import__("re").search(r"Calendar Time Zone:\s*([A-Za-z_+-]+/[A-Za-z0-9_+.-]+)", page_text)
+    try:
+        source_tz = ZoneInfo(tz_match.group(1)) if tz_match else timezone.utc
+    except Exception:
+        source_tz = timezone.utc
+
+    table = soup.find("table", class_="calendar__table")
+    if table is None:
+        raise ValueError("ForexFactory calendar table not found")
+
+    reference = now + timedelta(days=7)
+    rows: list[dict[str, Any]] = []
+    last_time = ""
+    for row in table.find_all("tr", class_="calendar__row"):
+        classes = set(row.get("class") or [])
+        if "calendar__row--day-breaker" in classes:
+            continue
+        date_row = row.find_previous("tr", class_="calendar__row--day-breaker")
+        date_text = date_row.get_text(" ", strip=True) if date_row else ""
+        base_date = _closest_calendar_date(date_text, reference)
+        if base_date is None:
+            continue
+
+        def cell_text(class_name: str) -> str:
+            cell = row.find("td", class_=class_name)
+            return cell.get_text(" ", strip=True) if cell else ""
+
+        time_text = cell_text("calendar__time")
+        if time_text:
+            last_time = time_text
+        else:
+            time_text = last_time
+        currency = cell_text("calendar__currency").upper()
+        title = cell_text("calendar__event")
+        if not time_text or not currency or not title:
+            continue
+        try:
+            parsed_time = datetime.strptime(time_text.lower(), "%I:%M%p").time()
+        except ValueError:
+            # 'All Day', 'Tentative', and date-range rows do not have a reliable
+            # clock time and cannot safely drive the 3-hour READY suppression.
+            continue
+        local_dt = datetime(
+            base_date.year, base_date.month, base_date.day,
+            parsed_time.hour, parsed_time.minute, tzinfo=source_tz,
+        )
+        impact_cell = row.find("td", class_="calendar__impact")
+        rows.append({
+            "country": currency,
+            "title": title,
+            "date": local_dt.astimezone(timezone.utc).isoformat(),
+            "impact": _ff_impact(impact_cell),
+            "forecast": cell_text("calendar__forecast") or None,
+            "previous": cell_text("calendar__previous") or None,
+            "source": "forexfactory_next_week_html",
+        })
+    return rows
+
+
+async def _fetch_next_week_calendar_page(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    response = await client.get(FF_CAL_NEXT_WEEK_PAGE, timeout=HTTP_TIMEOUT, follow_redirects=True)
+    response.raise_for_status()
+    return _parse_forex_factory_next_week_html(response.text)
+
+
 async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any]], str]:
     rows: list[dict[str, Any]] = []
     statuses: list[str] = []
-    for url in (FF_CAL_THIS_WEEK, FF_CAL_NEXT_WEEK):
-        try:
-            payload = await _get_json(client, url, attempts=1)
-            if isinstance(payload, list):
-                rows.extend(row for row in payload if isinstance(row, dict))
-                statuses.append("ok")
-        except Exception as exc:
-            statuses.append(f"unavailable:{type(exc).__name__}")
+
+    # Forex Factory's public JSON export is for the current week only.
+    try:
+        payload = await _get_json(client, FF_CAL_THIS_WEEK, attempts=1)
+        if isinstance(payload, list):
+            rows.extend(row for row in payload if isinstance(row, dict))
+            statuses.append("this_week_json:ok")
+        else:
+            statuses.append("this_week_json:invalid")
+    except Exception as exc:
+        statuses.append(f"this_week_json:unavailable:{type(exc).__name__}")
+
+    # The old ff_calendar_nextweek.json URL returns 404. v019 instead parses
+    # Forex Factory's actual ?week=next page as an independent fallback layer.
+    try:
+        next_rows = await _fetch_next_week_calendar_page(client)
+        rows.extend(next_rows)
+        statuses.append(f"next_week_html:ok:{len(next_rows)}")
+    except Exception as exc:
+        statuses.append(f"next_week_html:unavailable:{type(exc).__name__}")
 
     now = datetime.now(timezone.utc)
     events: list[dict[str, Any]] = []
@@ -812,13 +935,15 @@ async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
             "previous": row.get("previous") or row.get("Previous"),
         })
     events.sort(key=lambda x: x["time_utc"])
-    return events, "ok" if events else ";".join(statuses) or "unavailable"
+    status = ";".join(statuses) or "unavailable"
+    log.info("local_analysis calendar status=%s key_usd_events=%s", status, len(events))
+    return events, status
 
 
 async def fetch_market_bundle() -> dict[str, Any]:
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v017)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v019)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
@@ -855,7 +980,12 @@ async def fetch_market_bundle() -> dict[str, Any]:
 
         # Spot candles are the source of truth for crypto technical analysis.
         spot_details_task = _fetch_binance_spot_details(client, candidate_symbols, spot_map)
-        derivatives_task = _fetch_derivatives(client, candidate_symbols)
+        mexc_context_symbols = list(candidate_symbols)
+        for contract in COMMODITY_SYMBOLS.values():
+            base = contract[:-5] if contract.endswith("_USDT") else contract
+            if base not in mexc_context_symbols:
+                mexc_context_symbols.append(base)
+        derivatives_task = _fetch_derivatives(client, mexc_context_symbols, funding_symbols=candidate_symbols)
 
         commodity_tasks = {
             label: asyncio.create_task(_fetch_mexc_commodity_asset(client, label, contract))
@@ -897,6 +1027,15 @@ async def fetch_market_bundle() -> dict[str, Any]:
                     "status": f"unavailable:{type(exc).__name__}",
                 }
 
+        for label, contract in COMMODITY_SYMBOLS.items():
+            row = commodities.get(label)
+            if not isinstance(row, dict):
+                continue
+            base = contract[:-5] if contract.endswith("_USDT") else contract
+            live_price = (derivatives.get(base) or {}).get("mexc_last_price")
+            if live_price is not None:
+                row["current_price"] = live_price
+
         for asset, row in commodities.items():
             log.info(
                 "local_analysis commodity source=mexc_futures asset=%s contract=%s status=%s bars_1d=%s bars_4h=%s bars_1h=%s bars_15m=%s 15m_status=%s",
@@ -931,6 +1070,7 @@ async def fetch_market_bundle() -> dict[str, Any]:
             coin["binance_spot_symbol"] = pair
             coin["binance_spot_quote_volume_24h"] = _f(ticker.get("quoteVolume"), None) if pair else None
             coin["binance_spot_change_24h_pct"] = _f(ticker.get("priceChangePercent"), None) if pair else None
+            coin["binance_spot_last_price"] = _f(ticker.get("lastPrice"), None) if pair else None
 
         local_breadth = _compute_local_breadth(top100)
         log.info(
@@ -952,7 +1092,7 @@ async def fetch_market_bundle() -> dict[str, Any]:
             "pre_screen_long": long_pre,
             "pre_screen_short": short_pre,
             "crypto_technicals": spot_details,
-            "crypto_derivatives": derivatives,
+            "crypto_derivatives": {symbol: derivatives[symbol] for symbol in candidate_symbols if symbol in derivatives},
             "crypto_spot_liquidity": spot_liquidity,
             "local_breadth": local_breadth,
             "crypto_news": crypto_news,
@@ -1013,7 +1153,7 @@ def _history_bars_from_mexc(payload: dict[str, Any], now_ts: float) -> list[dict
 
 
 async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Fetch lightweight 1H history for v017 signal statistics.
+    """Fetch lightweight 1H history for v019 signal statistics.
 
     Crypto outcomes are measured on Binance Spot. Commodity outcomes use the
     same MEXC Futures contract that generated the published XAU/XAG/USOIL setup.
@@ -1031,7 +1171,7 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
     now_ms = int(now_ts * 1000)
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v017)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v019)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     sem = asyncio.Semaphore(6)
@@ -1047,7 +1187,7 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
             start_hour = int(issued_at // 3600) * 3600
             source_symbol = str(record.get("source_symbol") or "").strip()
             if record.get("market") == "commodity":
-                # Migrate pending legacy commodity records transparently: v017 always
+                # Migrate pending legacy commodity records transparently: v019 always
                 # evaluates commodity outcomes on the current MEXC contract.
                 source_symbol = COMMODITY_SYMBOLS.get(str(record.get("asset") or ""), source_symbol)
             if not source_symbol:

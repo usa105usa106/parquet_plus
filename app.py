@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -29,7 +30,7 @@ from telegram.ext import (
 )
 
 from collector import ArchiveBuildResult, build_market_archive
-from analyzer import build_final_analysis
+from analyzer import DEFAULT_COMMODITY_SCORE, build_final_analysis
 from market_data import fetch_market_bundle, fetch_signal_histories
 from signal_stats import ensure_stats, reconcile_stats, register_selected_signals, summary as stats_summary
 from config import APP_VERSION, Settings, load_settings
@@ -59,11 +60,28 @@ TIME_MODES: list[tuple[str, int]] = [
     ("4 часа", 4 * 60 * 60),
 ]
 
+SCORE_S_MIN = 0.0
+SCORE_S_MAX = 30.0
+FULL_LOG_HOURS = 24
+
+
+def _validated_commodity_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return float(DEFAULT_COMMODITY_SCORE)
+    if not math.isfinite(score) or not SCORE_S_MIN <= score <= SCORE_S_MAX:
+        return float(DEFAULT_COMMODITY_SCORE)
+    return round(score, 3)
+
+def _score_text(value: float) -> str:
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
 BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
 
-# Callback ids from older builds. v017 never launches OAuth/callback setup.
+# Callback ids from older builds. v019 never launches OAuth/callback setup.
 STALE_GMAIL_CALLBACKS = {
     "gmail_check",
     "gmail_config",
@@ -136,6 +154,7 @@ class Runtime:
                 "scans_created": int(value.get("scans_created", 0) or 0),
                 "telegram_archives_sent": int(value.get("telegram_archives_sent", 0) or 0),
                 "gmail_archives_sent": int(value.get("gmail_archives_sent", 0) or 0),
+                "commodity_score_threshold": _validated_commodity_score(value.get("commodity_score_threshold", DEFAULT_COMMODITY_SCORE)),
                 "scan_busy": False,
             }
         return result
@@ -179,6 +198,7 @@ class Runtime:
                 "scans_created": 0,
                 "telegram_archives_sent": 0,
                 "gmail_archives_sent": 0,
+                "commodity_score_threshold": float(DEFAULT_COMMODITY_SCORE),
                 "scan_busy": False,
             }
         return self.state[key]
@@ -195,6 +215,19 @@ class Runtime:
             idx = 0
             state["mode_index"] = 0
         return TIME_MODES[idx]
+
+    def commodity_score(self, chat_id: int) -> float:
+        state = self.chat_state(chat_id)
+        score = _validated_commodity_score(state.get("commodity_score_threshold", DEFAULT_COMMODITY_SCORE))
+        state["commodity_score_threshold"] = score
+        return score
+
+    def set_commodity_score(self, chat_id: int, value: float) -> float:
+        score = _validated_commodity_score(value)
+        state = self.chat_state(chat_id)
+        state["commodity_score_threshold"] = score
+        self.save_state()
+        return score
 
 
 def _runtime(context: ContextTypes.DEFAULT_TYPE) -> Runtime:
@@ -345,7 +378,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Parquet: собирает top-100 свечи/данные без выбора LONG/SHORT, отправляет ZIP в Telegram, затем в Gmail.\n"
         "Время: выкл → 15 мин → 30 мин → 1 час → 4 часа; повторяет то действие, которым запущен цикл.\n"
         "Почта: импорт сохранённой Gmail-авторизации одной Base64-строкой; без callback/OAuth.\n"
-        "Пинг: версия/отклик/uptime/RAM. /status — состояние. /log_full — полный журнал операций.",
+        "Пинг: версия/отклик/uptime/RAM. /status — состояние. /log_full — журнал за последние 24 часа.\n"
+        "/help — данные и команды; /score_s — порог score для XAU/XAG/USOIL.",
         reply_markup=_keyboard(runtime, chat_id),
     )
 
@@ -389,6 +423,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Анализ бота:",
         f"Последний анализ: {_msk_text(runtime, state.get('last_analysis_at'))}",
         f"Время анализа: {_elapsed(state.get('last_analysis_duration_seconds'))}",
+        f"Score сырья XAU/XAG/USOIL: {_score_text(runtime.commodity_score(chat_id))}",
         f"Сетапов: {ss['issued']} | Активировались: {ss['activated']} | Закрыто: {ss['closed']}",
         f"TP: {ss['tp']} | стоп: {ss['stop']} | таймаут: {ss['timeout']}",
         f"Win rate: {win_rate} | Средний: {avg_r} | PF: {pf}",
@@ -555,7 +590,12 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
             except Exception as exc:  # noqa: BLE001
                 log.warning("Signal stats reconciliation skipped: %s", exc)
 
-            verdict, selected = build_final_analysis(bundle)
+            commodity_score_threshold = runtime.commodity_score(chat_id)
+            log.info("analysis commodity_score_threshold chat_id=%s value=%.3f", chat_id, commodity_score_threshold)
+            verdict, selected = build_final_analysis(
+                bundle,
+                commodity_score_threshold=commodity_score_threshold,
+            )
             for category, signal in selected.items():
                 log.info(
                     "local_analysis selected category=%s asset=%s direction=%s status=%s score=%.3f completion_pct=%s rr=%s",
@@ -566,6 +606,7 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
             await application.bot.send_message(
                 chat_id=chat_id,
                 text=verdict,
+                parse_mode="HTML",
                 reply_markup=_keyboard(runtime, chat_id),
             )
             register_selected_signals(stats, selected, bundle, now_ts=time.time())
@@ -905,6 +946,81 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Отменено.")
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = _runtime(context)
+    if not _allowed(update, runtime):
+        return
+    chat_id = update.effective_chat.id
+    score = runtime.commodity_score(chat_id)
+    log.info("help requested chat_id=%s commodity_score=%.3f", chat_id, score)
+    text = (
+        f"Trading + Market Data Bot {BOT_VERSION}\n\n"
+        "Локальный Анализ:\n"
+        "• Крипто: Binance Spot 1D/4H/1H/15m, breadth, Spot depth, MEXC funding/OI/basis, RSS/news и календарь USD-событий.\n"
+        "• Сырьё: MEXC Futures XAU_USDT / SILVER_USDT / USOIL_USDT на 1D/4H/1H/15m.\n"
+        "• Крипто score: фиксированный порог 7.0.\n"
+        f"• Сырьевой score: сейчас {_score_text(score)}; по умолчанию {_score_text(DEFAULT_COMMODITY_SCORE)}.\n\n"
+        "Команды:\n"
+        "/score_s — показать текущий сырьевой score.\n"
+        "/score_s 4.5 — поставить один порог для XAU/XAG/USOIL.\n"
+        f"/score_s reset — вернуть {_score_text(DEFAULT_COMMODITY_SCORE)}.\n"
+        "Чем ниже score, тем больше сетапов и ниже строгость отбора; чем выше — тем меньше и строже.\n"
+        "/log_full — подробный журнал только за последние 24 часа.\n"
+        "/status — состояние бота и последнего анализа/Parquet.\n"
+        "/scan — Анализ; /parquet — собрать Parquet; /ping — проверка бота; /gmail — подключение почты.\n\n"
+        "Parquet: top-100 Binance Spot, 1H/1D/15m, Spot depth, breadth, MEXC funding/derivatives, XAU/XAG/USOIL и optional Deribit BTC/ETH options."
+    )
+    await update.effective_message.reply_text(text, reply_markup=_keyboard(runtime, chat_id))
+
+
+async def score_s(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = _runtime(context)
+    if not _allowed(update, runtime):
+        return
+    chat_id = update.effective_chat.id
+    current = runtime.commodity_score(chat_id)
+    args = list(context.args or [])
+    if not args:
+        await update.effective_message.reply_text(
+            f"Score сырья XAU/XAG/USOIL: {_score_text(current)}\n"
+            f"По умолчанию: {_score_text(DEFAULT_COMMODITY_SCORE)}\n"
+            "Изменить: /score_s 4.5\n"
+            "Сбросить: /score_s reset",
+            reply_markup=_keyboard(runtime, chat_id),
+        )
+        return
+
+    raw = args[0].strip().lower()
+    if raw in {"reset", "default", "сброс"}:
+        value = float(DEFAULT_COMMODITY_SCORE)
+    else:
+        try:
+            value = float(raw.replace(",", "."))
+        except ValueError:
+            await update.effective_message.reply_text(
+                "Неверное значение. Пример: /score_s 4.5",
+                reply_markup=_keyboard(runtime, chat_id),
+            )
+            return
+        if not math.isfinite(value) or not SCORE_S_MIN <= value <= SCORE_S_MAX:
+            await update.effective_message.reply_text(
+                f"Score должен быть от {SCORE_S_MIN:.1f} до {SCORE_S_MAX:.1f}. Пример: /score_s 4.5",
+                reply_markup=_keyboard(runtime, chat_id),
+            )
+            return
+
+    new_score = runtime.set_commodity_score(chat_id, value)
+    log.info(
+        "commodity_score changed chat_id=%s old=%.3f new=%.3f default=%.3f",
+        chat_id, current, new_score, float(DEFAULT_COMMODITY_SCORE),
+    )
+    await update.effective_message.reply_text(
+        f"✅ Score сырья XAU/XAG/USOIL: {_score_text(new_score)}\n"
+        "Новый порог применяется со следующего Анализа.",
+        reply_markup=_keyboard(runtime, chat_id),
+    )
+
+
 async def log_mail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     runtime = _runtime(context)
     if not _allowed(update, runtime):
@@ -929,6 +1045,7 @@ async def log_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             build_full_log_report,
             runtime.full_log_path,
             runtime.settings.exports_dir,
+            hours=FULL_LOG_HOURS,
         )
         with report.open("rb") as fh:
             await context.bot.send_document(chat_id=chat_id, document=fh, filename=report.name)
@@ -1043,6 +1160,8 @@ def main() -> None:
     app.add_handler(TypeHandler(Update, incoming_update_audit), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("score_s", score_s))
     app.add_handler(CommandHandler("scan", analysis))
     app.add_handler(CommandHandler("parquet", parquet_export))
     app.add_handler(CommandHandler("ping", ping))

@@ -1,0 +1,17 @@
+{
+  "version": "v019",
+  "live_external_apis_tested": false,
+  "checks": {
+    "compileall": "PASS",
+    "ast_parse": "PASS",
+    "duplicate_top_level": "PASS",
+    "telegram_html_output": "PASS",
+    "live_price_sources": "PASS_SYNTHETIC_SOURCE_INSPECTION",
+    "tiny_price_fixed_decimal": "PASS",
+    "score_s_preserved": "PASS",
+    "log_24h_rotation_preserved": "PASS",
+    "collector_unchanged": "PASS",
+    "old_version_absent": "PASS",
+    "zip_crc": "PASS"
+  }
+}

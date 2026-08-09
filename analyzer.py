@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v017
+# Coolify Trading Signal Bot v019
 
-BOT_VERSION = "v017"
+BOT_VERSION = "v019"
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -11,9 +12,11 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-USER_TIMEZONE = "Europe/Moscow"  # v017: all user-visible clock times are fixed to MSK (UTC+3)
+USER_TIMEZONE = "Europe/Moscow"  # v019: all user-visible clock times are fixed to MSK (UTC+3)
 MIN_CRYPTO_SCORE = float(os.getenv("MIN_CRYPTO_SCORE", "7.0"))
-MIN_COMMODITY_SCORE = float(os.getenv("MIN_COMMODITY_SCORE", "5.0"))
+DEFAULT_COMMODITY_SCORE = 5.0
+MIN_COMMODITY_SCORE = DEFAULT_COMMODITY_SCORE  # backward-compatible module default
+log = logging.getLogger("analyzer")
 
 TREND_SCORE = {
     "bullish": 3.0,
@@ -38,6 +41,7 @@ class Signal:
     status: str = "NO TRADE"
     score: float = -999.0
     completion_pct: int | None = None
+    current_price: float | None = None
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -272,7 +276,14 @@ def _select_resistance(price: float, tech: dict[str, Any]) -> float | None:
     return min(above) if above else None
 
 
-def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) -> Signal:
+def _make_setup(
+    asset: str,
+    tech: dict[str, Any],
+    direction: str,
+    score: float,
+    *,
+    current_price: float | None = None,
+) -> Signal:
     h4, h1 = tech["4h"], tech["1h"]
     price = float(h1["close"])
     atr = float(h4.get("atr14") or (price * 0.02))
@@ -293,7 +304,7 @@ def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) 
             inside = entry_low <= price <= entry_high
             midrange = 0.35 <= float(h4.get("range_position") or 0.5) <= 0.65
             confirmed = inside and _bar_is_bullish(h1) and price > float(h1.get("ema20") or 0) and _fifteen_minute_confirmation(tech, "long") is True and not midrange
-            return Signal(asset, direction, entry_low, entry_high, trigger, f"возврата выше {trigger}", stop, target, 2.7, "READY" if confirmed else "WAIT FOR PULLBACK", score)
+            return Signal(asset, direction, entry_low, entry_high, trigger, f"возврата выше {trigger}", stop, target, 2.7, "READY" if confirmed else "WAIT FOR PULLBACK", score, current_price=current_price if current_price is not None else price)
 
         breakout = float(h4.get("prior_range_high") or price)
         entry_low = breakout - 0.12 * atr
@@ -301,7 +312,7 @@ def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) 
         stop = breakout - 0.88 * atr
         risk = ((entry_low + entry_high) / 2) - stop
         target = ((entry_low + entry_high) / 2) + 2.6 * risk
-        return Signal(asset, direction, entry_low, entry_high, breakout, f"1H закрытия выше {breakout} и ретеста сверху", stop, target, 2.6, "WAIT FOR BREAKOUT + RETEST", score)
+        return Signal(asset, direction, entry_low, entry_high, breakout, f"1H закрытия выше {breakout} и ретеста сверху", stop, target, 2.6, "WAIT FOR BREAKOUT + RETEST", score, current_price=current_price if current_price is not None else price)
 
     aligned = d1_trend in {"bearish", "bearish_early"} and h4_trend in {"bearish", "bearish_early"}
     resistance = _select_resistance(price, tech)
@@ -314,7 +325,7 @@ def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) 
         inside = entry_low <= price <= entry_high
         midrange = 0.35 <= float(h4.get("range_position") or 0.5) <= 0.65
         confirmed = inside and _bar_is_bearish(h1) and price < float(h1.get("ema20") or price * 2) and _fifteen_minute_confirmation(tech, "short") is True and not midrange
-        return Signal(asset, direction, entry_low, entry_high, resistance, f"медвежьего отказа от {resistance}", stop, target, 2.8, "READY" if confirmed else "WAIT FOR BOUNCE", score)
+        return Signal(asset, direction, entry_low, entry_high, resistance, f"медвежьего отказа от {resistance}", stop, target, 2.8, "READY" if confirmed else "WAIT FOR BOUNCE", score, current_price=current_price if current_price is not None else price)
 
     breakdown = float(h4.get("prior_range_low") or price)
     entry_low = breakdown - 0.22 * atr
@@ -322,7 +333,7 @@ def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) 
     stop = breakdown + 0.88 * atr
     risk = stop - ((entry_low + entry_high) / 2)
     target = ((entry_low + entry_high) / 2) - 2.7 * risk
-    return Signal(asset, direction, entry_low, entry_high, breakdown, f"1H закрытия ниже {breakdown} и ретеста снизу", stop, target, 2.7, "WAIT FOR BREAKDOWN + RETEST", score)
+    return Signal(asset, direction, entry_low, entry_high, breakdown, f"1H закрытия ниже {breakdown} и ретеста снизу", stop, target, 2.7, "WAIT FOR BREAKDOWN + RETEST", score, current_price=current_price if current_price is not None else price)
 
 
 def _crypto_candidates(bundle: dict[str, Any], direction: str) -> list[Signal]:
@@ -364,7 +375,10 @@ def _crypto_candidates(bundle: dict[str, Any], direction: str) -> list[Signal]:
         if direction == "short" and float(tech["4h"].get("range_position") or 0.5) < 0.04:
             score -= 2.0
 
-        signal = _make_setup(symbol, tech, direction, score)
+        live_price = coin.get("binance_spot_last_price")
+        if live_price is None:
+            live_price = coin.get("price")
+        signal = _make_setup(symbol, tech, direction, score, current_price=float(live_price) if live_price is not None else None)
         signal.completion_pct = _estimate_completion_pct(
             signal, threshold=MIN_CRYPTO_SCORE,
         )
@@ -387,94 +401,137 @@ def _macro_bias(bundle: dict[str, Any], asset: str, direction: str) -> float:
     return score
 
 
-def _commodity_candidates(bundle: dict[str, Any], direction: str) -> list[Signal]:
+def _commodity_candidates(
+    bundle: dict[str, Any],
+    direction: str,
+    *,
+    threshold: float = DEFAULT_COMMODITY_SCORE,
+) -> list[Signal]:
     signals: list[Signal] = []
     for asset, tech in (bundle.get("commodities") or {}).items():
         if not isinstance(tech, dict) or "1d" not in tech:
+            log.info(
+                "commodity_candidate asset=%s direction=%s skipped=missing_technicals threshold=%.3f",
+                asset, direction, threshold,
+            )
             continue
         macro_adj = _macro_bias(bundle, asset, direction)
         news_adj = _news_adjustment((bundle.get("commodity_news") or {}).get(asset, {}), direction) * 0.65
         entry_adj = _entry_confirmation_adjustment(tech, direction)
-        score = _direction_score(tech, direction)
-        score += macro_adj + news_adj + entry_adj
-        score -= _extension_penalty(tech, direction)
-        if asset == "XAG/USD":
-            score -= 0.35
-        signal = _make_setup(asset, tech, direction, score)
-        signal.completion_pct = _estimate_completion_pct(
-            signal, threshold=MIN_COMMODITY_SCORE,
+        trend_score = _direction_score(tech, direction)
+        extension_penalty = _extension_penalty(tech, direction)
+        silver_penalty = 0.35 if asset == "XAG/USD" else 0.0
+        score = trend_score + macro_adj + news_adj + entry_adj - extension_penalty - silver_penalty
+        live_price = tech.get("current_price")
+        if live_price is None:
+            live_price = (tech.get("15m") or {}).get("close") or (tech.get("1h") or {}).get("close")
+        signal = _make_setup(asset, tech, direction, score, current_price=float(live_price) if live_price is not None else None)
+        signal.completion_pct = _estimate_completion_pct(signal, threshold=threshold)
+        reason = "qualifies" if score >= threshold else "below_threshold"
+        log.info(
+            "commodity_candidate asset=%s direction=%s score=%.3f threshold=%.3f result=%s "
+            "trend=%.3f macro=%.3f news=%.3f entry15m=%.3f extension_penalty=%.3f silver_penalty=%.3f "
+            "trend_1d=%s trend_4h=%s trend_1h=%s setup_status=%s completion_pct=%s",
+            asset, direction, score, threshold, reason,
+            trend_score, macro_adj, news_adj, entry_adj, extension_penalty, silver_penalty,
+            (tech.get("1d") or {}).get("trend"),
+            (tech.get("4h") or {}).get("trend"),
+            (tech.get("1h") or {}).get("trend"),
+            signal.status, signal.completion_pct,
         )
         signals.append(signal)
     return sorted(signals, key=lambda s: s.score, reverse=True)
 
 
 def _fmt_price(value: float | None) -> str:
+    """Human-friendly fixed-point USD price, never scientific notation.
+
+    Precision grows automatically for tiny-price assets, while trailing zeroes
+    are stripped (e.g. 0.010000 -> 0.01, 1.050000 -> 1.05).
+    """
     if value is None or not math.isfinite(value):
         return "—"
+    value = float(value)
     abs_value = abs(value)
-    if abs_value >= 1000:
-        decimals = 0 if abs_value >= 10000 else 1
-    elif abs_value >= 100:
-        decimals = 2
-    elif abs_value >= 10:
+    if abs_value == 0:
+        return "$0"
+    if abs_value >= 100:
         decimals = 2
     elif abs_value >= 1:
-        decimals = 3
-    elif abs_value >= 0.1:
         decimals = 4
-    elif abs_value >= 0.01:
-        decimals = 5
     else:
-        decimals = 7
-    text = f"{value:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", " ")
+        magnitude = math.floor(math.log10(abs_value))
+        decimals = min(16, max(4, -magnitude + 4))
+    raw = f"{value:,.{decimals}f}"
+    if "." in raw:
+        raw = raw.rstrip("0").rstrip(".")
+    text = raw.replace(",", "X").replace(".", ",").replace("X", " ")
     return f"${text}"
+
+
+def _bold(text: str) -> str:
+    import html
+    return f"<b>{html.escape(str(text))}</b>"
 
 
 def _fmt_level_for_condition(value: float | None) -> str:
     return _fmt_price(value)
 
 
-def _clean_condition(signal: Signal) -> str:
+def _title_html(title: str) -> str:
+    import html
+    escaped = html.escape(title)
+    escaped = escaped.replace("LONG", "<b>LONG</b>")
+    escaped = escaped.replace("SHORT", "<b>SHORT</b>")
+    return escaped
+
+
+def _clean_condition_html(signal: Signal) -> str:
+    import html
     if signal.trigger_level is None:
-        return signal.condition
-    trigger = _fmt_level_for_condition(signal.trigger_level)
+        return html.escape(signal.condition)
+    trigger = _bold(_fmt_level_for_condition(signal.trigger_level))
     if signal.status == "WAIT FOR PULLBACK":
         return f"возврата выше {trigger}"
     if signal.status == "WAIT FOR BOUNCE":
         return f"медвежьего отказа от {trigger}"
     if signal.status == "WAIT FOR BREAKOUT + RETEST":
-        return f"1H закрытия выше {trigger} и ретеста"
+        return f"{_bold('1H')} закрытия выше {trigger} и ретеста"
     if signal.status == "WAIT FOR BREAKDOWN + RETEST":
-        return f"1H закрытия ниже {trigger} и ретеста"
-    return f"подтверждения 1H у {trigger}"
+        return f"{_bold('1H')} закрытия ниже {trigger} и ретеста"
+    return f"подтверждения {_bold('1H')} у {trigger}"
 
 
 def _signal_block(signal: Signal, title: str, include_rr: bool) -> str:
+    import html
+    title_html = _title_html(title)
     if signal.status == "NO TRADE" or signal.entry_low is None or signal.entry_high is None:
         lines = [
-            f"{title}: NO TRADE",
+            f"{title_html}: {_bold('NO TRADE')}",
             "Вход: —",
             "Стоп: —",
             "Основная цель: —",
         ]
         if include_rr:
             lines.append("R/R: —")
-        lines.append("Статус: NO TRADE")
+        lines.append(f"Статус: {_bold('NO TRADE')}")
         return "\n".join(lines)
 
+    asset = _bold(signal.asset)
+    current = _bold(_fmt_price(signal.current_price)) if signal.current_price is not None else "—"
     lines = [
-        f"{title}: {signal.asset}",
-        f"Отработка: {signal.completion_pct}%" if signal.completion_pct is not None else "Отработка: —",
-        f"Вход: {_fmt_price(signal.entry_low)}–{_fmt_price(signal.entry_high)} после {_clean_condition(signal)}",
-        f"Стоп: {_fmt_price(signal.stop)}",
-        f"Основная цель: {_fmt_price(signal.target)}",
+        f"{title_html}: {asset} — {current}",
+        f"Отработка: {_bold(f'{signal.completion_pct}%')}" if signal.completion_pct is not None else "Отработка: —",
+        f"Вход: {_bold(_fmt_price(signal.entry_low))}–{_bold(_fmt_price(signal.entry_high))} после {_clean_condition_html(signal)}",
+        f"Стоп: {_bold(_fmt_price(signal.stop))}",
+        f"Основная цель: {_bold(_fmt_price(signal.target))}",
     ]
     if include_rr:
         rr = str(round(float(signal.rr or 0.0), 1)).replace(".", ",")
-        lines.append(f"R/R: около {rr}")
-    lines.append(f"Статус: {signal.status}")
+        lines.append(f"R/R: около {_bold(rr)}")
+    status = _bold("NO TRADE") if signal.status == "NO TRADE" else html.escape(signal.status)
+    lines.append(f"Статус: {status}")
     return "\n".join(lines)
-
 
 def _no_trade(direction: str, asset: str = "NO TRADE") -> Signal:
     return Signal(asset=asset, direction=direction, status="NO TRADE", score=-999)
@@ -518,26 +575,35 @@ def _next_event_text(bundle: dict[str, Any]) -> str:
         tz = ZoneInfo("UTC")
     dt = datetime.fromisoformat(event["time_utc"]).astimezone(tz)
     month_names = ["янв.", "февр.", "марта", "апр.", "мая", "июня", "июля", "авг.", "сент.", "окт.", "нояб.", "дек."]
-    title = _event_title_ru(str(event.get("title") or "макрособытие"))
-    return f"Следующий ключевой риск — {title} {dt.day} {month_names[dt.month - 1]} в {dt:%H:%M} МСК (UTC+3)."
+    import html
+    title = html.escape(_event_title_ru(str(event.get("title") or "макрособытие")))
+    return (
+        f"Следующий ключевой риск — {title} {_bold(str(dt.day))} {month_names[dt.month - 1]} "
+        f"в {_bold(dt.strftime('%H:%M'))} МСК (UTC+{_bold('3')})."
+    )
 
 
-def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
+def select_final_signals(
+    bundle: dict[str, Any],
+    *,
+    commodity_score_threshold: float = DEFAULT_COMMODITY_SCORE,
+) -> dict[str, Signal]:
     """Select the four published setups without formatting them.
 
-    The structured result is used by v017 statistics tracking so outcomes are
+    The structured result is used by v019 statistics tracking so outcomes are
     measured from the exact levels that were shown to the user, not by parsing
-    Telegram text.
+    Telegram text. Commodity threshold is runtime-configurable per Telegram chat.
     """
+    commodity_score_threshold = float(commodity_score_threshold)
     crypto_long_list = _crypto_candidates(bundle, "long")
     crypto_short_list = _crypto_candidates(bundle, "short")
-    commodity_long_list = _commodity_candidates(bundle, "long")
-    commodity_short_list = _commodity_candidates(bundle, "short")
+    commodity_long_list = _commodity_candidates(bundle, "long", threshold=commodity_score_threshold)
+    commodity_short_list = _commodity_candidates(bundle, "short", threshold=commodity_score_threshold)
 
     crypto_long = crypto_long_list[0] if crypto_long_list and crypto_long_list[0].score >= MIN_CRYPTO_SCORE else _no_trade("long")
     crypto_short = crypto_short_list[0] if crypto_short_list and crypto_short_list[0].score >= MIN_CRYPTO_SCORE else _no_trade("short")
-    commodity_long = commodity_long_list[0] if commodity_long_list and commodity_long_list[0].score >= MIN_COMMODITY_SCORE else _no_trade("long")
-    commodity_short = commodity_short_list[0] if commodity_short_list and commodity_short_list[0].score >= MIN_COMMODITY_SCORE else _no_trade("short")
+    commodity_long = commodity_long_list[0] if commodity_long_list and commodity_long_list[0].score >= commodity_score_threshold else _no_trade("long")
+    commodity_short = commodity_short_list[0] if commodity_short_list and commodity_short_list[0].score >= commodity_score_threshold else _no_trade("short")
 
     # Never publish opposite crypto directions for the same ticker. Prefer the
     # stronger score and use the next qualifying candidate on the other side.
@@ -552,10 +618,10 @@ def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
     # Do not publish simultaneous opposite directions on the same commodity unless one is clearly superior.
     if commodity_long.asset != "NO TRADE" and commodity_long.asset == commodity_short.asset:
         if commodity_long.score >= commodity_short.score:
-            alternative = next((s for s in commodity_short_list if s.asset != commodity_long.asset and s.score >= MIN_COMMODITY_SCORE), None)
+            alternative = next((s for s in commodity_short_list if s.asset != commodity_long.asset and s.score >= commodity_score_threshold), None)
             commodity_short = alternative or _no_trade("short")
         else:
-            alternative = next((s for s in commodity_long_list if s.asset != commodity_short.asset and s.score >= MIN_COMMODITY_SCORE), None)
+            alternative = next((s for s in commodity_long_list if s.asset != commodity_short.asset and s.score >= commodity_score_threshold), None)
             commodity_long = alternative or _no_trade("long")
 
     selected = {
@@ -584,10 +650,14 @@ def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
     return selected
 
 
-def build_final_analysis(bundle: dict[str, Any]) -> tuple[str, dict[str, Signal]]:
-    selected = select_final_signals(bundle)
+def build_final_analysis(
+    bundle: dict[str, Any],
+    *,
+    commodity_score_threshold: float = DEFAULT_COMMODITY_SCORE,
+) -> tuple[str, dict[str, Signal]]:
+    selected = select_final_signals(bundle, commodity_score_threshold=commodity_score_threshold)
     verdict = "\n\n".join([
-        f"ФИНАЛЬНЫЙ ВЕРДИКТ · {BOT_VERSION}",
+        f"ФИНАЛЬНЫЙ ВЕРДИКТ · {_bold(BOT_VERSION)}",
         _signal_block(selected["crypto_long"], "Крипто LONG", include_rr=True),
         _signal_block(selected["crypto_short"], "Крипто SHORT", include_rr=True),
         _signal_block(selected["commodity_long"], "Сырьевой LONG", include_rr=False),
@@ -597,5 +667,9 @@ def build_final_analysis(bundle: dict[str, Any]) -> tuple[str, dict[str, Signal]
     return verdict, selected
 
 
-def build_final_verdict(bundle: dict[str, Any]) -> str:
-    return build_final_analysis(bundle)[0]
+def build_final_verdict(
+    bundle: dict[str, Any],
+    *,
+    commodity_score_threshold: float = DEFAULT_COMMODITY_SCORE,
+) -> str:
+    return build_final_analysis(bundle, commodity_score_threshold=commodity_score_threshold)[0]

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-APP_VERSION = "v017"
+APP_VERSION = "v019"
 
 
 def _normalize_public_base_url(value: str) -> str:
