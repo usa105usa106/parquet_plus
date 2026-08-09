@@ -61,13 +61,12 @@ class ArchiveIdentity:
 
 
 class GmailOAuthManager:
-    """Google OAuth callback server + Gmail API sender.
+    """Gmail API sender with session-import support.
 
-    Google Client ID/Secret may come from an encrypted Telegram setup file or,
-    for backward compatibility, from Coolify environment variables. OAuth tokens
-    and sent-archive idempotency state persist in redundant primary/backup storage.
-    A browser health probe must reach the public Coolify route before credentials
-    can be entered or an OAuth authorization URL can be generated.
+    In the default session-only mode, imported encrypted client credentials and
+    refresh tokens are sufficient; no Google OAuth callback URL is required.
+    Legacy callback helpers remain for backward-compatible code paths but the
+    web server registers only /healthz in session-only deployments.
     """
 
     def __init__(self, settings: Any, secret_store: Any, logger: logging.Logger):
@@ -224,8 +223,8 @@ class GmailOAuthManager:
             "ROUTING",
             "=" * 72,
             "Mode: direct Coolify/Traefik route to the bot container on port 80.",
-            "There is no separate nginx gateway in v70.",
-            "A browser request that reaches the application is recorded above as event=health_request_received or event=oauth_callback_received.",
+            "There is no separate nginx gateway; session-import mode does not use a Google OAuth callback route.",
+            "In session-import mode the registered browser route is /healthz; legacy OAuth callback helpers are not exposed.",
         ])
         report_path.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
         self._audit("diagnostic_report_built", chat_id=chat_id, filename=report_path.name, size=report_path.stat().st_size)
@@ -285,6 +284,8 @@ class GmailOAuthManager:
     @property
     def configured(self) -> bool:
         client_id, client_secret, _ = self._client_credentials()
+        if bool(getattr(self.settings, "gmail_session_only", False)):
+            return bool(client_id and client_secret)
         return bool(client_id and client_secret and self.settings.gmail_redirect_uri)
 
     @property
@@ -301,9 +302,9 @@ class GmailOAuthManager:
         return email_value or None
 
     def status_text(self) -> str:
-        if not self.settings.gmail_redirect_uri:
-            return "нет callback URL Coolify"
         client_id, client_secret, source = self._client_credentials()
+        if not bool(getattr(self.settings, "gmail_session_only", False)) and not self.settings.gmail_redirect_uri:
+            return "нет callback URL Coolify"
         if not (client_id and client_secret):
             return "нужно ввести Client ID/Secret в Telegram"
         email_value = self.account_email
@@ -392,7 +393,7 @@ class GmailOAuthManager:
         if self._runner is not None:
             self._audit("health_server_already_started")
             return
-        # v008 uses Gmail session import only. Port 80 remains solely for
+        # v017 uses Gmail session import only. Port 80 remains solely for
         # Docker/Coolify health checks; the Google OAuth callback route is not
         # registered at all.
         app = web.Application(client_max_size=1024 * 1024)

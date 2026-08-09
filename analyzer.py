@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v008
+# Coolify Trading Signal Bot v017
 
-BOT_VERSION = "v008"
+BOT_VERSION = "v017"
 
 import math
 import os
@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-USER_TIMEZONE = "Europe/Moscow"  # v008: all user-visible clock times are fixed to MSK (UTC+3)
+USER_TIMEZONE = "Europe/Moscow"  # v017: all user-visible clock times are fixed to MSK (UTC+3)
 MIN_CRYPTO_SCORE = float(os.getenv("MIN_CRYPTO_SCORE", "7.0"))
 MIN_COMMODITY_SCORE = float(os.getenv("MIN_COMMODITY_SCORE", "5.0"))
 
@@ -37,6 +37,7 @@ class Signal:
     rr: float | None = None
     status: str = "NO TRADE"
     score: float = -999.0
+    completion_pct: int | None = None
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -91,27 +92,45 @@ def _extension_penalty(tech: dict[str, Any], direction: str) -> float:
     return penalty
 
 
-def _derivative_adjustment(row: dict[str, Any], direction: str) -> float:
+def _derivative_adjustment(
+    row: dict[str, Any],
+    direction: str,
+    spot_change_24h_pct: float | None = None,
+) -> float:
+    """Small MEXC confirmation layer: funding, basis and futures/spot divergence."""
     if not row:
         return 0.0
     funding = float(row.get("funding_pct") or 0.0)
-    oi_change = float(row.get("open_interest_change_pct") or 0.0)
-    price_change = float(row.get("futures_change_24h_pct") or 0.0)
+    basis = float(row.get("basis_pct") or 0.0)
+    futures_change = float(row.get("futures_change_24h_pct") or 0.0)
+    divergence = futures_change - float(spot_change_24h_pct or 0.0)
     adj = 0.0
     if direction == "long":
         if funding > 0.05:
             adj -= min(2.5, (funding - 0.05) * 18)
-        if funding < -0.03:
+        elif funding < -0.03:
             adj += min(1.2, abs(funding + 0.03) * 12)
-        if oi_change > 12 and price_change > 6:
-            adj -= 1.2
+        if basis > 0.65:
+            adj -= min(1.4, (basis - 0.65) * 1.2)
+        elif -0.45 <= basis < 0:
+            adj += 0.25
+        if divergence > 4.0:
+            adj -= min(1.2, (divergence - 4.0) * 0.18)
+        elif divergence < -3.0:
+            adj += 0.35
     else:
         if funding < -0.05:
             adj -= min(2.5, abs(funding + 0.05) * 18)
-        if funding > 0.03:
+        elif funding > 0.03:
             adj += min(1.2, (funding - 0.03) * 12)
-        if oi_change > 12 and price_change < -6:
-            adj -= 1.2
+        if basis < -0.65:
+            adj -= min(1.4, (abs(basis) - 0.65) * 1.2)
+        elif 0 < basis <= 0.45:
+            adj += 0.25
+        if divergence < -4.0:
+            adj -= min(1.2, (abs(divergence) - 4.0) * 0.18)
+        elif divergence > 3.0:
+            adj += 0.35
     return adj
 
 
@@ -125,6 +144,118 @@ def _relative_strength_score(coin: dict[str, Any], btc: dict[str, Any], directio
     rel7 = float(coin.get("change_7d_pct") or 0.0) - float(btc.get("change_7d_pct") or 0.0)
     score = 0.22 * _clip(rel24, -12, 12) + 0.30 * _clip(rel7, -20, 20)
     return score if direction == "long" else -score
+
+
+def _fifteen_minute_confirmation(tech: dict[str, Any], direction: str) -> bool | None:
+    tf = tech.get("15m")
+    if not isinstance(tf, dict):
+        return None
+    close = float(tf.get("close") or 0.0)
+    ema20 = tf.get("ema20")
+    rsi14 = float(tf.get("rsi14") or 50.0)
+    trend = str(tf.get("trend") or "mixed")
+    if close <= 0 or ema20 is None:
+        return None
+    if direction == "long":
+        return bool(close >= float(ema20) and rsi14 >= 48 and trend not in {"bearish", "bearish_early"} and _bar_is_bullish(tf))
+    return bool(close <= float(ema20) and rsi14 <= 52 and trend not in {"bullish", "bullish_early"} and _bar_is_bearish(tf))
+
+
+def _entry_confirmation_adjustment(tech: dict[str, Any], direction: str) -> float:
+    confirmed = _fifteen_minute_confirmation(tech, direction)
+    if confirmed is True:
+        return 1.4
+    if confirmed is False:
+        return -1.1
+    return -0.25
+
+
+def _crypto_history_adjustment(tech: dict[str, Any]) -> float:
+    bars = int(float((tech.get("1d") or {}).get("history_bars") or 0))
+    if bars >= 300:
+        return 0.0
+    if bars >= 200:
+        return -0.25
+    if bars >= 100:
+        return -0.7
+    if bars >= 50:
+        return -1.2
+    if bars >= 21:
+        return -2.2
+    return -4.0
+
+
+def _breadth_adjustment(bundle: dict[str, Any], direction: str) -> float:
+    breadth = bundle.get("local_breadth") or {}
+    if breadth.get("status") != "ok":
+        return 0.0
+    positive = float(breadth.get("positive_pct") or 50.0)
+    median24 = float(breadth.get("median_change_24h_pct") or 0.0)
+    raw = _clip((positive - 50.0) / 12.0, -1.5, 1.5) + _clip(median24 / 3.0, -0.8, 0.8)
+    return raw if direction == "long" else -raw
+
+
+def _spot_liquidity_adjustment(row: dict[str, Any], direction: str) -> float:
+    if not row or row.get("status") != "ok":
+        return 0.0
+    spread = float(row.get("spread_bps") or 0.0)
+    imbalance = float(row.get("imbalance_0_5pct") or 0.0)
+    adj = _clip(imbalance * 2.1, -1.1, 1.1)
+    if direction == "short":
+        adj = -adj
+    if spread > 12:
+        adj -= min(1.4, (spread - 12) / 12)
+    elif spread <= 4:
+        adj += 0.2
+    return adj
+
+
+def _crypto_regime_adjustment(bundle: dict[str, Any], asset: str, direction: str) -> float:
+    macro = bundle.get("macro") or {}
+    global_crypto = bundle.get("global_crypto") or {}
+    score = 0.0
+    market_change = float(global_crypto.get("market_cap_change_24h_pct") or 0.0)
+    score += _clip(market_change / 3.5, -1.0, 1.0)
+    dominance = global_crypto.get("btc_dominance_pct")
+    if asset != "BTC" and dominance is not None:
+        dom = float(dominance)
+        # Level-only dominance is a weak regime cue, so keep its weight small.
+        if dom >= 60:
+            score -= 0.35
+        elif dom <= 50:
+            score += 0.25
+    dxy = macro.get("DXY") or {}
+    us10 = macro.get("US10Y") or {}
+    if isinstance(dxy, dict) and "1d" in dxy:
+        score -= 0.28 * TREND_SCORE.get(dxy["1d"].get("trend"), 0.0)
+    if isinstance(us10, dict) and "1d" in us10:
+        score -= 0.18 * TREND_SCORE.get(us10["1d"].get("trend"), 0.0)
+    score = _clip(score, -2.0, 2.0)
+    return score if direction == "long" else -score
+
+
+def _estimate_completion_pct(
+    signal: Signal,
+    *,
+    threshold: float,
+) -> int | None:
+    """Heuristic current-setup confidence, not historical winrate.
+
+    Convert the final composite score only once. Raw trend/15m/breadth/depth/
+    derivatives/news inputs are already inside ``signal.score`` and are not
+    re-added here, preventing double weighting in the displayed percentage.
+    """
+    if signal.status == "NO TRADE":
+        return None
+    edge = signal.score - threshold
+    pct = 59.0 + _clip(edge * 2.0, -9.0, 22.0)
+    # Execution phase is not a second market-data vote: it only expresses how
+    # close the already-scored setup is to an actionable entry.
+    if signal.status == "READY":
+        pct += 5.0
+    elif signal.status in {"WAIT FOR PULLBACK", "WAIT FOR BOUNCE"}:
+        pct += 2.0
+    return int(round(_clip(pct, 50.0, 86.0)))
 
 
 def _select_support(price: float, tech: dict[str, Any]) -> float | None:
@@ -160,7 +291,8 @@ def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) 
             risk = ((entry_low + entry_high) / 2) - stop
             target = ((entry_low + entry_high) / 2) + 2.7 * risk
             inside = entry_low <= price <= entry_high
-            confirmed = inside and _bar_is_bullish(h1) and price > float(h1.get("ema20") or 0)
+            midrange = 0.35 <= float(h4.get("range_position") or 0.5) <= 0.65
+            confirmed = inside and _bar_is_bullish(h1) and price > float(h1.get("ema20") or 0) and _fifteen_minute_confirmation(tech, "long") is True and not midrange
             return Signal(asset, direction, entry_low, entry_high, trigger, f"возврата выше {trigger}", stop, target, 2.7, "READY" if confirmed else "WAIT FOR PULLBACK", score)
 
         breakout = float(h4.get("prior_range_high") or price)
@@ -180,7 +312,8 @@ def _make_setup(asset: str, tech: dict[str, Any], direction: str, score: float) 
         risk = stop - ((entry_low + entry_high) / 2)
         target = ((entry_low + entry_high) / 2) - 2.8 * risk
         inside = entry_low <= price <= entry_high
-        confirmed = inside and _bar_is_bearish(h1) and price < float(h1.get("ema20") or price * 2)
+        midrange = 0.35 <= float(h4.get("range_position") or 0.5) <= 0.65
+        confirmed = inside and _bar_is_bearish(h1) and price < float(h1.get("ema20") or price * 2) and _fifteen_minute_confirmation(tech, "short") is True and not midrange
         return Signal(asset, direction, entry_low, entry_high, resistance, f"медвежьего отказа от {resistance}", stop, target, 2.8, "READY" if confirmed else "WAIT FOR BOUNCE", score)
 
     breakdown = float(h4.get("prior_range_low") or price)
@@ -198,6 +331,7 @@ def _crypto_candidates(bundle: dict[str, Any], direction: str) -> list[Signal]:
     lookup = {coin["symbol"]: coin for coin in top100}
     techs = bundle.get("crypto_technicals", {})
     derivatives = bundle.get("crypto_derivatives", {})
+    liquidity = bundle.get("crypto_spot_liquidity", {})
     news = bundle.get("crypto_news", {})
 
     signals: list[Signal] = []
@@ -208,20 +342,33 @@ def _crypto_candidates(bundle: dict[str, Any], direction: str) -> list[Signal]:
         if not coin:
             continue
         volume = coin.get("binance_spot_quote_volume_24h") or coin.get("volume_24h")
+        spot_change = coin.get("binance_spot_change_24h_pct")
+        if spot_change is None:
+            spot_change = coin.get("change_24h_pct")
+        derivative_adj = _derivative_adjustment(derivatives.get(symbol, {}), direction, float(spot_change or 0.0))
+        news_adj = _news_adjustment(news.get(symbol, {}), direction)
+        breadth_adj = _breadth_adjustment(bundle, direction)
+        depth_adj = _spot_liquidity_adjustment(liquidity.get(symbol, {}), direction)
+        regime_adj = _crypto_regime_adjustment(bundle, symbol, direction)
+        entry_adj = _entry_confirmation_adjustment(tech, direction)
+        history_adj = _crypto_history_adjustment(tech)
+
         score = _direction_score(tech, direction)
         score += _relative_strength_score(coin, btc, direction)
         score += 1.2 * _liquidity_points(float(volume or 0.0))
-        score += _derivative_adjustment(derivatives.get(symbol, {}), direction)
-        score += _news_adjustment(news.get(symbol, {}), direction)
+        score += derivative_adj + news_adj + breadth_adj + depth_adj + regime_adj + entry_adj + history_adj
         score -= _extension_penalty(tech, direction)
 
-        # Avoid blindly fading the strongest daily trend / chasing the weakest one.
         if direction == "long" and float(tech["4h"].get("range_position") or 0.5) > 0.96:
             score -= 2.0
         if direction == "short" and float(tech["4h"].get("range_position") or 0.5) < 0.04:
             score -= 2.0
 
-        signals.append(_make_setup(symbol, tech, direction, score))
+        signal = _make_setup(symbol, tech, direction, score)
+        signal.completion_pct = _estimate_completion_pct(
+            signal, threshold=MIN_CRYPTO_SCORE,
+        )
+        signals.append(signal)
     return sorted(signals, key=lambda s: s.score, reverse=True)
 
 
@@ -245,14 +392,19 @@ def _commodity_candidates(bundle: dict[str, Any], direction: str) -> list[Signal
     for asset, tech in (bundle.get("commodities") or {}).items():
         if not isinstance(tech, dict) or "1d" not in tech:
             continue
+        macro_adj = _macro_bias(bundle, asset, direction)
+        news_adj = _news_adjustment((bundle.get("commodity_news") or {}).get(asset, {}), direction) * 0.65
+        entry_adj = _entry_confirmation_adjustment(tech, direction)
         score = _direction_score(tech, direction)
-        score += _macro_bias(bundle, asset, direction)
-        score += _news_adjustment((bundle.get("commodity_news") or {}).get(asset, {}), direction) * 0.65
+        score += macro_adj + news_adj + entry_adj
         score -= _extension_penalty(tech, direction)
-        # Gold/silver are more volatile around macro; demand cleaner structure.
         if asset == "XAG/USD":
             score -= 0.35
-        signals.append(_make_setup(asset, tech, direction, score))
+        signal = _make_setup(asset, tech, direction, score)
+        signal.completion_pct = _estimate_completion_pct(
+            signal, threshold=MIN_COMMODITY_SCORE,
+        )
+        signals.append(signal)
     return sorted(signals, key=lambda s: s.score, reverse=True)
 
 
@@ -312,6 +464,7 @@ def _signal_block(signal: Signal, title: str, include_rr: bool) -> str:
 
     lines = [
         f"{title}: {signal.asset}",
+        f"Отработка: {signal.completion_pct}%" if signal.completion_pct is not None else "Отработка: —",
         f"Вход: {_fmt_price(signal.entry_low)}–{_fmt_price(signal.entry_high)} после {_clean_condition(signal)}",
         f"Стоп: {_fmt_price(signal.stop)}",
         f"Основная цель: {_fmt_price(signal.target)}",
@@ -372,7 +525,7 @@ def _next_event_text(bundle: dict[str, Any]) -> str:
 def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
     """Select the four published setups without formatting them.
 
-    The structured result is used by v008 statistics tracking so outcomes are
+    The structured result is used by v017 statistics tracking so outcomes are
     measured from the exact levels that were shown to the user, not by parsing
     Telegram text.
     """
@@ -385,6 +538,16 @@ def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
     crypto_short = crypto_short_list[0] if crypto_short_list and crypto_short_list[0].score >= MIN_CRYPTO_SCORE else _no_trade("short")
     commodity_long = commodity_long_list[0] if commodity_long_list and commodity_long_list[0].score >= MIN_COMMODITY_SCORE else _no_trade("long")
     commodity_short = commodity_short_list[0] if commodity_short_list and commodity_short_list[0].score >= MIN_COMMODITY_SCORE else _no_trade("short")
+
+    # Never publish opposite crypto directions for the same ticker. Prefer the
+    # stronger score and use the next qualifying candidate on the other side.
+    if crypto_long.asset != "NO TRADE" and crypto_long.asset == crypto_short.asset:
+        if crypto_long.score >= crypto_short.score:
+            alternative = next((s for s in crypto_short_list if s.asset != crypto_long.asset and s.score >= MIN_CRYPTO_SCORE), None)
+            crypto_short = alternative or _no_trade("short")
+        else:
+            alternative = next((s for s in crypto_long_list if s.asset != crypto_short.asset and s.score >= MIN_CRYPTO_SCORE), None)
+            crypto_long = alternative or _no_trade("long")
 
     # Do not publish simultaneous opposite directions on the same commodity unless one is clearly superior.
     if commodity_long.asset != "NO TRADE" and commodity_long.asset == commodity_short.asset:
@@ -413,6 +576,8 @@ def select_final_signals(bundle: dict[str, Any]) -> dict[str, Signal]:
                 for signal in selected.values():
                     if signal.status == "READY":
                         signal.status = "WAIT FOR PULLBACK" if signal.direction == "long" else "WAIT FOR BOUNCE"
+                        if signal.completion_pct is not None:
+                            signal.completion_pct = max(50, signal.completion_pct - 6)
         except Exception:
             pass
 

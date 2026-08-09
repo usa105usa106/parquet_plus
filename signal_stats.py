@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v008
+# Coolify Trading Signal Bot v017
 
 import math
 import time
@@ -9,7 +9,7 @@ from typing import Any
 
 from analyzer import Signal
 
-BOT_VERSION = "v008"
+BOT_VERSION = "v017"
 SIGNAL_HORIZON_SECONDS = 14 * 24 * 60 * 60
 
 OPEN_STATES = {"pending", "active"}
@@ -18,7 +18,7 @@ INACTIVE_STATES = {"expired", "superseded"}
 
 
 def ensure_stats(raw: Any) -> dict[str, Any]:
-    """Return a JSON-safe v008 stats object, preserving compatible records."""
+    """Return a JSON-safe v017 stats object, preserving compatible records."""
     if not isinstance(raw, dict):
         raw = {}
     records = raw.get("records")
@@ -140,6 +140,7 @@ def register_selected_signals(
             "stop": float(signal.stop),
             "target": float(signal.target),
             "rr": _num(signal.rr),
+            "completion_pct_at_issue": int(signal.completion_pct) if signal.completion_pct is not None else None,
             "status_at_issue": signal.status,
             "last_published_status": signal.status,
             "source_symbol": _source_symbol(category, signal, bundle),

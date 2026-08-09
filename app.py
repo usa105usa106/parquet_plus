@@ -63,7 +63,7 @@ BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
 
-# Callback ids from older builds. v008 never launches OAuth/callback setup.
+# Callback ids from older builds. v017 never launches OAuth/callback setup.
 STALE_GMAIL_CALLBACKS = {
     "gmail_check",
     "gmail_config",
@@ -400,6 +400,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Размер: {_human_bytes(state.get('last_archive_size_bytes'))}",
         f"Binance Spot: {state.get('last_binance_full_count') if state.get('last_binance_full_count') is not None else '—'}/100 полных × 999 1H",
         f"Частичная история: {state.get('last_binance_partial_count') if state.get('last_binance_partial_count') is not None else '—'}",
+        "Доп. данные: 365×1D · 288×15m · Spot depth · breadth · MEXC OI/basis · BTC/ETH options",
         f"MEXC funding: {state.get('last_mexc_funding_coverage') if state.get('last_mexc_funding_coverage') is not None else '—'}/100 контрактов",
         f"XAU/XAG/USOIL: {state.get('last_commodities_ok_count') if state.get('last_commodities_ok_count') is not None else '—'}/3 полных × 999 1H",
         f"Gmail: {runtime.gmail.status_text()} · последний архив: {state.get('last_gmail_status') or '—'}",
@@ -484,10 +485,10 @@ async def _send_archive_then_gmail(
             document=fh,
             filename=telegram_name,
             caption=(
-                f"Market Scan {BOT_VERSION} · 999 закрытых 1H\n"
-                f"Binance Spot: {result.binance_full_count}/100 полных · "
+                f"Market Scan {BOT_VERSION} · 999×1H + 365×1D + 288×15m\n"
+                f"Binance Spot: {result.binance_full_count}/100 полных 1H · "
                 f"MEXC funding: {result.mexc_funding_coverage}/100 · commodities: {result.commodities_ok_count}/3\n"
-                "Архив ZIP с Parquet и PROMPT_FOR_CHATGPT.txt."
+                "ZIP: breadth + Spot depth + MEXC OI/basis/funding + BTC/ETH options + prompt."
             ),
         )
     delivered_name = getattr(getattr(sent, "document", None), "file_name", None) or telegram_name
@@ -539,10 +540,12 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
         started = time.monotonic()
         log.info("analysis started chat_id=%s show_progress=%s", chat_id, show_progress)
         progress = None
-        if show_progress:
-            progress = await application.bot.send_message(chat_id=chat_id, text="⏳ Сканирую рынок…")
-        await runtime.scan_semaphore.acquire()
+        semaphore_acquired = False
         try:
+            if show_progress:
+                progress = await application.bot.send_message(chat_id=chat_id, text="⏳ Сканирую рынок…")
+            await runtime.scan_semaphore.acquire()
+            semaphore_acquired = True
             bundle = await fetch_market_bundle()
             stats = ensure_stats(state.get("signal_stats"))
             state["signal_stats"] = stats
@@ -553,6 +556,12 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
                 log.warning("Signal stats reconciliation skipped: %s", exc)
 
             verdict, selected = build_final_analysis(bundle)
+            for category, signal in selected.items():
+                log.info(
+                    "local_analysis selected category=%s asset=%s direction=%s status=%s score=%.3f completion_pct=%s rr=%s",
+                    category, signal.asset, signal.direction, signal.status, float(signal.score),
+                    signal.completion_pct, signal.rr,
+                )
             await _safe_delete(progress)
             await application.bot.send_message(
                 chat_id=chat_id,
@@ -574,7 +583,8 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
                 reply_markup=_keyboard(runtime, chat_id),
             )
         finally:
-            runtime.scan_semaphore.release()
+            if semaphore_acquired:
+                runtime.scan_semaphore.release()
             finished = time.time()
             duration = max(0.0, time.monotonic() - started)
             state["scan_busy"] = False
@@ -597,11 +607,13 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
         started = time.monotonic()
         log.info("parquet started chat_id=%s show_progress=%s", chat_id, show_progress)
         holder: dict[str, Any] = {}
-        if show_progress:
-            holder["message"] = await application.bot.send_message(chat_id=chat_id, text="⏳ Собираю свежий Parquet без кэша…")
-            holder["last_edit"] = time.monotonic()
-        await runtime.scan_semaphore.acquire()
+        semaphore_acquired = False
         try:
+            if show_progress:
+                holder["message"] = await application.bot.send_message(chat_id=chat_id, text="⏳ Собираю свежий Parquet без кэша…")
+                holder["last_edit"] = time.monotonic()
+            await runtime.scan_semaphore.acquire()
+            semaphore_acquired = True
             async def progress(text: str) -> None:
                 log.info("parquet progress chat_id=%s stage=%s", chat_id, text)
                 if show_progress:
@@ -661,7 +673,8 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
                 reply_markup=_keyboard(runtime, chat_id),
             )
         finally:
-            runtime.scan_semaphore.release()
+            if semaphore_acquired:
+                runtime.scan_semaphore.release()
             finished = time.time()
             duration = max(0.0, time.monotonic() - started)
             state["scan_busy"] = False

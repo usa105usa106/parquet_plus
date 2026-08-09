@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v008
+# Coolify Trading Signal Bot v017
 
 import asyncio
 import logging
 import math
 import os
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from statistics import mean
+from statistics import mean, median
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -20,10 +21,9 @@ from asset_filters import is_excluded_asset
 log = logging.getLogger(__name__)
 
 BINANCE_SPOT_BASE = os.getenv("BINANCE_SPOT_BASE_URL", "https://api.binance.com").rstrip("/")
-MEXC_CONTRACT_BASE = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com").rstrip("/")
+MEXC_CONTRACT_BASE = os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.com").rstrip("/")
 COINPAPRIKA_BASE = os.getenv("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1").rstrip("/")
 COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3").rstrip("/")
-YAHOO_CHART_BASE = os.getenv("YAHOO_CHART_BASE_URL", "https://query1.finance.yahoo.com/v8/finance/chart").rstrip("/")
 FF_CAL_THIS_WEEK = os.getenv("FF_CAL_THIS_WEEK_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
 FF_CAL_NEXT_WEEK = os.getenv("FF_CAL_NEXT_WEEK_URL", "https://nfs.faireconomy.media/ff_calendar_nextweek.json")
 GOOGLE_NEWS_RSS = os.getenv("GOOGLE_NEWS_RSS_URL", "https://news.google.com/rss/search")
@@ -39,15 +39,13 @@ SPOT_ALIASES = {
 
 
 COMMODITY_SYMBOLS = {
-    "XAU/USD": ["XAUUSD=X", "GC=F"],
-    "XAG/USD": ["XAGUSD=X", "SI=F"],
-    "USOIL": ["CL=F"],
+    "XAU/USD": "XAU_USDT",
+    "XAG/USD": "SILVER_USDT",
+    "USOIL": "USOIL_USDT",
 }
 
-MACRO_SYMBOLS = {
-    "DXY": ["DX-Y.NYB"],
-    "US10Y": ["^TNX"],
-}
+# v017 local commodity candles come directly from MEXC Futures. DXY/US10Y are
+# not fetched locally; the crypto regime remains based on broad crypto data and BTC dominance.
 
 IMPORTANT_EVENT_KEYWORDS = (
     "non-farm", "nonfarm", "employment change", "unemployment", "average hourly",
@@ -75,6 +73,19 @@ def _f(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def _retry_after_seconds(response: httpx.Response | None) -> float | None:
+    if response is None:
+        return None
+    raw = str(response.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return max(0.0, value) if math.isfinite(value) else None
+
+
 async def _get_json(
     client: httpx.AsyncClient,
     url: str,
@@ -90,8 +101,24 @@ async def _get_json(
             return response.json()
         except Exception as exc:
             last_error = exc
-            if attempt < attempts - 1:
-                await asyncio.sleep(0.6 * (2**attempt))
+            if attempt >= attempts - 1:
+                break
+            delay = 0.6 * (2**attempt)
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {418, 429}:
+                retry_after = _retry_after_seconds(exc.response)
+                if retry_after is not None:
+                    if retry_after > 120.0:
+                        log.warning(
+                            "HTTP rate-limit abort status=%s retry_after_sec=%.3f url=%s",
+                            exc.response.status_code, retry_after, url,
+                        )
+                        break
+                    delay = max(delay, retry_after)
+                log.warning(
+                    "HTTP rate-limit backoff status=%s retry_after_sec=%s sleep_sec=%.3f url=%s",
+                    exc.response.status_code, retry_after, delay, url,
+                )
+            await asyncio.sleep(delay)
     assert last_error is not None
     raise last_error
 
@@ -142,6 +169,8 @@ def rsi(values: list[float], period: int = 14) -> float | None:
         delta = values[i] - values[i - 1]
         avg_gain = ((avg_gain * (period - 1)) + max(delta, 0.0)) / period
         avg_loss = ((avg_loss * (period - 1)) + max(-delta, 0.0)) / period
+    if avg_gain == 0 and avg_loss == 0:
+        return 50.0
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -149,7 +178,10 @@ def rsi(values: list[float], period: int = 14) -> float | None:
 
 
 def _technical_from_rows(rows: list[list[Any]], interval: str) -> dict[str, Any]:
-    if len(rows) < 55:
+    # v017: keep younger listings usable instead of requiring a full 365D
+    # history. Twenty-one closed bars are enough for a cautious partial view;
+    # EMA50/EMA200 simply remain unavailable until enough history exists.
+    if len(rows) < 21:
         raise ValueError(f"not enough {interval} candles: {len(rows)}")
 
     opens = [float(row[1]) for row in rows]
@@ -159,7 +191,7 @@ def _technical_from_rows(rows: list[list[Any]], interval: str) -> dict[str, Any]
     volumes = [float(row[7]) if len(row) > 7 and row[7] is not None else 0.0 for row in rows]
 
     e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
+    e50 = ema(closes, 50) if len(closes) >= 50 else None
     e200 = ema(closes, 200) if len(closes) >= 200 else None
     r14 = rsi(closes, 14)
 
@@ -202,6 +234,8 @@ def _technical_from_rows(rows: list[list[Any]], interval: str) -> dict[str, Any]
         "return_5_bars_pct": ((close / closes[-6]) - 1) * 100 if len(closes) >= 6 else 0.0,
         "return_20_bars_pct": ((close / closes[-21]) - 1) * 100 if len(closes) >= 21 else 0.0,
         "recent_quote_volume": sum(volumes[-lookback:]),
+        "history_bars": len(rows),
+        "history_status": "FULL" if (interval != "1d" or len(rows) >= 365) else "PARTIAL_HISTORY",
         "last_candle": {
             "open": opens[-1],
             "high": highs[-1],
@@ -341,29 +375,150 @@ async def _fetch_binance_spot_details(
     symbols: list[str],
     spot_map: dict[str, str],
 ) -> dict[str, dict[str, Any]]:
+    """Fetch closed Binance Spot candles for the local analyzer.
+
+    v017 requests up to 365 closed 1D candles and 288 closed 15m candles.
+    A shorter 1D history is retained as PARTIAL_HISTORY; it is never rejected
+    merely because the listing is younger than 365 days. 15m is optional: if
+    that single request fails the 1D/4H/1H core remains usable.
+    """
     sem = asyncio.Semaphore(8)
+    now_ms = int(time.time() * 1000)
+    interval_ms = {"1d": 86_400_000, "4h": 14_400_000, "1h": 3_600_000, "15m": 900_000}
+    cutoffs = {name: (now_ms // size) * size for name, size in interval_ms.items()}
+    log.info(
+        "local_analysis Binance closed-candle cutoffs 1d=%s 4h=%s 1h=%s 15m=%s",
+        cutoffs["1d"], cutoffs["4h"], cutoffs["1h"], cutoffs["15m"],
+    )
 
     async def fetch_one(symbol: str) -> tuple[str, dict[str, Any]]:
         pair = spot_map[symbol]
         async with sem:
+            results = await asyncio.gather(
+                _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "1d", "limit": 365, "endTime": cutoffs["1d"] - 1}),
+                _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "4h", "limit": 180, "endTime": cutoffs["4h"] - 1}),
+                _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "1h", "limit": 180, "endTime": cutoffs["1h"] - 1}),
+                _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "15m", "limit": 288, "endTime": cutoffs["15m"] - 1}),
+                return_exceptions=True,
+            )
+            core = results[:3]
+            if any(isinstance(item, Exception) for item in core):
+                exc = next(item for item in core if isinstance(item, Exception))
+                log.info("Spot core candle fetch failed for %s: %s", symbol, exc)
+                return symbol, {"spot_symbol": pair, "status": f"unavailable:{type(exc).__name__}"}
             try:
-                k1d, k4h, k1h = await asyncio.gather(
-                    _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "1d", "limit": 220}),
-                    _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "4h", "limit": 180}),
-                    _get_json(client, f"{BINANCE_SPOT_BASE}/api/v3/klines", params={"symbol": pair, "interval": "1h", "limit": 180}),
-                )
-                return symbol, {
+                k1d, k4h, k1h = core
+                data: dict[str, Any] = {
                     "spot_symbol": pair,
                     "1d": _technical_from_rows(k1d, "1d"),
                     "4h": _technical_from_rows(k4h, "4h"),
                     "1h": _technical_from_rows(k1h, "1h"),
+                    "closed_candles_only": True,
                 }
             except Exception as exc:
-                log.info("Spot candle fetch failed for %s: %s", symbol, exc)
+                log.info("Spot technical build failed for %s: %s", symbol, exc)
                 return symbol, {"spot_symbol": pair, "status": f"unavailable:{type(exc).__name__}"}
+
+            k15 = results[3]
+            if isinstance(k15, Exception):
+                data["15m_status"] = f"unavailable:{type(k15).__name__}"
+            else:
+                try:
+                    data["15m"] = _technical_from_rows(k15, "15m")
+                    data["15m_status"] = "ok"
+                except Exception as exc:
+                    data["15m_status"] = f"unavailable:{type(exc).__name__}"
+            return symbol, data
 
     pairs = await asyncio.gather(*(fetch_one(symbol) for symbol in symbols))
     return dict(pairs)
+
+
+async def _fetch_binance_spot_liquidity(
+    client: httpx.AsyncClient,
+    symbols: list[str],
+    spot_map: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Best-effort L2 confirmation for only the local shortlist.
+
+    Uses up to 500 Binance Spot levels and only scores ±0.5% imbalance when the
+    returned snapshot actually covers both sides of that band. Failure or partial
+    depth never aborts analysis.
+    """
+    sem = asyncio.Semaphore(4)
+
+    async def one(symbol: str) -> tuple[str, dict[str, Any]]:
+        pair = spot_map.get(symbol)
+        if not pair:
+            return symbol, {"status": "unavailable:no_spot_pair"}
+        async with sem:
+            try:
+                payload = await _get_json(
+                    client, f"{BINANCE_SPOT_BASE}/api/v3/depth",
+                    params={"symbol": pair, "limit": 500}, attempts=2,
+                )
+                bids = [(float(p), float(q)) for p, q in (payload.get("bids") or []) if float(p) > 0 and float(q) >= 0]
+                asks = [(float(p), float(q)) for p, q in (payload.get("asks") or []) if float(p) > 0 and float(q) >= 0]
+                if not bids or not asks:
+                    return symbol, {"status": "unavailable:empty_book"}
+                best_bid, best_ask = bids[0][0], asks[0][0]
+                mid = (best_bid + best_ask) / 2.0
+                spread_bps = ((best_ask - best_bid) / mid * 10_000.0) if mid else None
+                lower, upper = mid * 0.995, mid * 1.005
+                covers_band = min(p for p, _ in bids) <= lower and max(p for p, _ in asks) >= upper
+                bid_depth = sum(p * q for p, q in bids if p >= lower)
+                ask_depth = sum(p * q for p, q in asks if p <= upper)
+                total = bid_depth + ask_depth
+                imbalance = (bid_depth - ask_depth) / total if total > 0 else 0.0
+                return symbol, {
+                    "status": "ok" if covers_band else "partial_depth",
+                    "spot_symbol": pair,
+                    "spread_bps": spread_bps,
+                    "coverage_0_5pct": covers_band,
+                    "book_bid_levels": len(bids),
+                    "book_ask_levels": len(asks),
+                    "bid_depth_0_5pct_quote": bid_depth,
+                    "ask_depth_0_5pct_quote": ask_depth,
+                    "imbalance_0_5pct": imbalance if covers_band else None,
+                }
+            except Exception as exc:
+                return symbol, {"status": f"unavailable:{type(exc).__name__}"}
+
+    pairs = await asyncio.gather(*(one(symbol) for symbol in symbols))
+    return dict(pairs)
+
+
+def _compute_local_breadth(top100: list[dict[str, Any]]) -> dict[str, Any]:
+    changes: list[float] = []
+    btc_change: float | None = None
+    for coin in top100:
+        change = _f(coin.get("binance_spot_change_24h_pct"), None)
+        if change is None:
+            change = _f(coin.get("change_24h_pct"), None)
+        if change is None:
+            continue
+        changes.append(change)
+        if str(coin.get("symbol") or "").upper() == "BTC":
+            btc_change = change
+    if not changes:
+        return {"status": "unavailable:no_changes"}
+    adv = sum(1 for x in changes if x > 0)
+    dec = sum(1 for x in changes if x < 0)
+    flat = len(changes) - adv - dec
+    above_btc = None
+    if btc_change is not None:
+        above_btc = 100.0 * sum(1 for x in changes if x > btc_change) / len(changes)
+    return {
+        "status": "ok",
+        "assets": len(changes),
+        "advancers": adv,
+        "decliners": dec,
+        "unchanged": flat,
+        "positive_pct": 100.0 * adv / len(changes),
+        "median_change_24h_pct": median(changes),
+        "above_btc_24h_pct": above_btc,
+        "btc_change_24h_pct": btc_change,
+    }
 
 
 async def _fetch_mexc_derivatives(
@@ -373,7 +528,7 @@ async def _fetch_mexc_derivatives(
     """Fetch MEXC perpetual funding in one public/no-auth request.
 
     MEXC's all-contract ticker includes fundingRate, 24h move/turnover and holdVol.
-    In v008 MEXC is the only funding source; Binance Futures is not queried.
+    In v017 MEXC is the only funding source; Binance Futures is not queried.
     """
     try:
         payload = await _get_json(
@@ -413,6 +568,10 @@ async def _fetch_mexc_derivatives(
 
         funding = _f(ticker.get("fundingRate"), None)
         rise_fall = _f(ticker.get("riseFallRate"), None)
+        last_price = _f(ticker.get("lastPrice"), None)
+        fair_price = _f(ticker.get("fairPrice"), None)
+        index_price = _f(ticker.get("indexPrice"), None)
+        basis_pct = ((fair_price / index_price) - 1.0) * 100.0 if fair_price is not None and index_price not in (None, 0) else None
         row: dict[str, Any] = {
             "symbol": contract_symbol,
             "funding_source": "mexc",
@@ -420,8 +579,10 @@ async def _fetch_mexc_derivatives(
             "futures_change_24h_pct": rise_fall * 100 if rise_fall is not None else None,
             "futures_quote_volume": _f(ticker.get("amount24"), None),
             "mexc_hold_volume": _f(ticker.get("holdVol"), None),
-            "mexc_fair_price": _f(ticker.get("fairPrice"), None),
-            "mexc_index_price": _f(ticker.get("indexPrice"), None),
+            "mexc_last_price": last_price,
+            "mexc_fair_price": fair_price,
+            "mexc_index_price": index_price,
+            "basis_pct": basis_pct,
         }
         result[matched] = row
 
@@ -434,7 +595,7 @@ async def _fetch_derivatives(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Fetch derivatives context from MEXC only.
 
-    Funding is intentionally MEXC-only in v008. Binance Futures is not called at
+    Funding is intentionally MEXC-only in v017. Binance Futures is not called at
     all, so an unavailable Binance Futures API cannot delay or alter the scan.
     """
     mexc_rows, mexc_status = await _fetch_mexc_derivatives(client, symbols)
@@ -446,76 +607,126 @@ async def _fetch_derivatives(
         "mexc_futures": mexc_status,
     }
 
-def _yahoo_rows(payload: dict[str, Any]) -> list[list[Any]]:
-    chart = payload.get("chart") or {}
-    results = chart.get("result") or []
-    if not results:
-        raise ValueError("Yahoo chart returned no result")
-    result = results[0]
-    timestamps = result.get("timestamp") or []
-    quote_rows = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-    opens = quote_rows.get("open") or []
-    highs = quote_rows.get("high") or []
-    lows = quote_rows.get("low") or []
-    closes = quote_rows.get("close") or []
-    volumes = quote_rows.get("volume") or []
+def _mexc_kline_rows(
+    payload: dict[str, Any],
+    *,
+    interval_seconds: int,
+    cutoff_ms: int,
+    max_rows: int,
+) -> list[list[Any]]:
+    """Convert a MEXC Futures kline response to the local technical row shape.
+
+    The request is made with ``end=cutoff-1``; this function still defensively
+    removes any bar whose opening timestamp is at/after the closed-candle cutoff.
+    """
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise ValueError(f"MEXC kline bad response: {str(payload)[:160]}")
+    data = payload.get("data") or {}
+    times = data.get("time") or []
+    opens = data.get("open") or []
+    closes = data.get("close") or []
+    highs = data.get("high") or []
+    lows = data.get("low") or []
+    vols = data.get("vol") or []
+    amounts = data.get("amount") or []
     rows: list[list[Any]] = []
-    for i, ts in enumerate(timestamps):
+    interval_ms = interval_seconds * 1000
+    for i, ts in enumerate(times):
         try:
-            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
-        except IndexError:
+            open_ms = int(ts) * 1000
+            if open_ms >= cutoff_ms:
+                continue
+            o = float(opens[i])
+            h = float(highs[i])
+            l = float(lows[i])
+            c = float(closes[i])
+        except (IndexError, TypeError, ValueError):
             continue
-        if any(v is None for v in (o, h, l, c)):
-            continue
-        volume = volumes[i] if i < len(volumes) and volumes[i] is not None else 0.0
-        rows.append([int(ts) * 1000, float(o), float(h), float(l), float(c), float(volume), int(ts) * 1000, float(volume)])
-    return rows
-
-
-def _aggregate_4h(hourly: list[list[Any]]) -> list[list[Any]]:
-    buckets: dict[int, list[list[Any]]] = {}
-    for row in hourly:
-        timestamp_seconds = int(row[0] // 1000)
-        bucket = timestamp_seconds - (timestamp_seconds % (4 * 3600))
-        buckets.setdefault(bucket, []).append(row)
-    output: list[list[Any]] = []
-    for bucket in sorted(buckets):
-        rows = buckets[bucket]
-        if not rows:
-            continue
-        output.append([
-            bucket * 1000,
-            rows[0][1],
-            max(r[2] for r in rows),
-            min(r[3] for r in rows),
-            rows[-1][4],
-            sum(r[5] for r in rows),
-            (bucket + 4 * 3600) * 1000,
-            sum(r[7] for r in rows),
+        vol = float(vols[i]) if i < len(vols) and vols[i] is not None else 0.0
+        amount = float(amounts[i]) if i < len(amounts) and amounts[i] is not None else vol
+        rows.append([
+            open_ms,
+            o,
+            h,
+            l,
+            c,
+            vol,
+            open_ms + interval_ms - 1,
+            amount,
         ])
-    return output
+    rows.sort(key=lambda row: int(row[0]))
+    return rows[-max_rows:]
 
 
-async def _fetch_yahoo_asset(client: httpx.AsyncClient, aliases: list[str]) -> tuple[str, dict[str, Any]]:
-    last_exc: Exception | None = None
-    for symbol in aliases:
+async def _fetch_mexc_commodity_asset(
+    client: httpx.AsyncClient,
+    label: str,
+    contract: str,
+) -> tuple[str, dict[str, Any]]:
+    """Fetch native closed MEXC Futures candles for XAU/XAG/USOIL.
+
+    No alternate chart-provider fallback is used in v017. 1D is retained up to 365 bars, native 4H
+    and 1H are used directly, and 15m is best-effort entry confirmation.
+    """
+    now_ms = int(time.time() * 1000)
+    specs = {
+        "1d": ("Day1", 86_400, 365),
+        "4h": ("Hour4", 14_400, 180),
+        "1h": ("Min60", 3_600, 180),
+        "15m": ("Min15", 900, 288),
+    }
+    cutoffs = {
+        name: (now_ms // (seconds * 1000)) * (seconds * 1000)
+        for name, (_, seconds, _) in specs.items()
+    }
+
+    async def fetch_tf(name: str) -> Any:
+        interval, _, _ = specs[name]
+        return await _get_json(
+            client,
+            f"{MEXC_CONTRACT_BASE}/api/v1/contract/kline/{contract}",
+            params={"interval": interval, "end": int(cutoffs[name] // 1000) - 1},
+            attempts=3 if name != "15m" else 2,
+        )
+
+    results = await asyncio.gather(
+        fetch_tf("1d"), fetch_tf("4h"), fetch_tf("1h"), fetch_tf("15m"),
+        return_exceptions=True,
+    )
+    if any(isinstance(item, Exception) for item in results[:3]):
+        exc = next(item for item in results[:3] if isinstance(item, Exception))
+        raise RuntimeError(f"MEXC commodity core unavailable {contract}: {exc}")
+
+    rows_by_tf: dict[str, list[list[Any]]] = {}
+    for index, name in enumerate(("1d", "4h", "1h")):
+        _, seconds, limit = specs[name]
+        rows_by_tf[name] = _mexc_kline_rows(
+            results[index], interval_seconds=seconds, cutoff_ms=cutoffs[name], max_rows=limit,
+        )
+
+    data: dict[str, Any] = {
+        "source": "mexc_futures",
+        "source_symbol": contract,
+        "mexc_contract": contract,
+        "1d": _technical_from_rows(rows_by_tf["1d"], "1d"),
+        "4h": _technical_from_rows(rows_by_tf["4h"], "4h"),
+        "1h": _technical_from_rows(rows_by_tf["1h"], "1h"),
+        "closed_candles_only": True,
+    }
+    min15 = results[3]
+    if isinstance(min15, Exception):
+        data["15m_status"] = f"unavailable:{type(min15).__name__}"
+    else:
         try:
-            daily_payload, hourly_payload = await asyncio.gather(
-                _get_json(client, f"{YAHOO_CHART_BASE}/{symbol}", params={"interval": "1d", "range": "1y", "includePrePost": "false", "events": "div,splits"}, attempts=2),
-                _get_json(client, f"{YAHOO_CHART_BASE}/{symbol}", params={"interval": "1h", "range": "3mo", "includePrePost": "false", "events": "div,splits"}, attempts=2),
+            _, seconds, limit = specs["15m"]
+            rows15 = _mexc_kline_rows(
+                min15, interval_seconds=seconds, cutoff_ms=cutoffs["15m"], max_rows=limit,
             )
-            daily = _yahoo_rows(daily_payload)
-            hourly = _yahoo_rows(hourly_payload)
-            four_hour = _aggregate_4h(hourly)
-            return symbol, {
-                "source_symbol": symbol,
-                "1d": _technical_from_rows(daily, "1d"),
-                "4h": _technical_from_rows(four_hour, "4h"),
-                "1h": _technical_from_rows(hourly, "1h"),
-            }
+            data["15m"] = _technical_from_rows(rows15, "15m")
+            data["15m_status"] = "ok"
         except Exception as exc:
-            last_exc = exc
-    raise RuntimeError(f"Yahoo unavailable for {aliases}: {last_exc}")
+            data["15m_status"] = f"unavailable:{type(exc).__name__}"
+    return label, data
 
 
 async def _fetch_news_score(client: httpx.AsyncClient, query: str) -> dict[str, Any]:
@@ -607,7 +818,7 @@ async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
 async def fetch_market_bundle() -> dict[str, Any]:
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v008)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v017)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
@@ -647,16 +858,19 @@ async def fetch_market_bundle() -> dict[str, Any]:
         derivatives_task = _fetch_derivatives(client, candidate_symbols)
 
         commodity_tasks = {
-            label: asyncio.create_task(_fetch_yahoo_asset(client, aliases))
-            for label, aliases in COMMODITY_SYMBOLS.items()
-        }
-        macro_tasks = {
-            label: asyncio.create_task(_fetch_yahoo_asset(client, aliases))
-            for label, aliases in MACRO_SYMBOLS.items()
+            label: asyncio.create_task(_fetch_mexc_commodity_asset(client, label, contract))
+            for label, contract in COMMODITY_SYMBOLS.items()
         }
         calendar_task = asyncio.create_task(_fetch_calendar(client))
 
         spot_details, (derivatives, derivative_sources) = await asyncio.gather(spot_details_task, derivatives_task)
+
+        # Compact Spot order book only for the strongest pre-screened local candidates.
+        local_shortlist: list[str] = []
+        for symbol in long_pre[:4] + short_pre[:4]:
+            if symbol in spot_map and symbol not in local_shortlist:
+                local_shortlist.append(symbol)
+        spot_liquidity = await _fetch_binance_spot_liquidity(client, local_shortlist, spot_map)
 
         # News/fundamental filter only for the strongest pre-screened names to keep scans quick.
         coin_lookup = {coin["symbol"]: coin for coin in top100}
@@ -673,18 +887,32 @@ async def fetch_market_bundle() -> dict[str, Any]:
         commodities: dict[str, dict[str, Any]] = {}
         for label, task in commodity_tasks.items():
             try:
-                source_symbol, data = await task
+                _, data = await task
                 commodities[label] = data
             except Exception as exc:
-                commodities[label] = {"status": f"unavailable:{type(exc).__name__}"}
+                log.info("MEXC commodity unavailable asset=%s: %s", label, exc)
+                commodities[label] = {
+                    "source": "mexc_futures",
+                    "source_symbol": COMMODITY_SYMBOLS[label],
+                    "status": f"unavailable:{type(exc).__name__}",
+                }
 
+        for asset, row in commodities.items():
+            log.info(
+                "local_analysis commodity source=mexc_futures asset=%s contract=%s status=%s bars_1d=%s bars_4h=%s bars_1h=%s bars_15m=%s 15m_status=%s",
+                asset,
+                row.get("source_symbol") if isinstance(row, dict) else None,
+                row.get("status", "ok") if isinstance(row, dict) else "unavailable",
+                ((row.get("1d") or {}).get("history_bars") if isinstance(row, dict) else None),
+                ((row.get("4h") or {}).get("history_bars") if isinstance(row, dict) else None),
+                ((row.get("1h") or {}).get("history_bars") if isinstance(row, dict) else None),
+                ((row.get("15m") or {}).get("history_bars") if isinstance(row, dict) else None),
+                row.get("15m_status") if isinstance(row, dict) else None,
+            )
+
+        # Keep the macro key for analyzer compatibility; DXY/US10Y are intentionally
+        # not collected locally and therefore contribute zero.
         macro: dict[str, dict[str, Any]] = {}
-        for label, task in macro_tasks.items():
-            try:
-                source_symbol, data = await task
-                macro[label] = data
-            except Exception as exc:
-                macro[label] = {"status": f"unavailable:{type(exc).__name__}"}
 
         events, calendar_status = await calendar_task
 
@@ -704,6 +932,19 @@ async def fetch_market_bundle() -> dict[str, Any]:
             coin["binance_spot_quote_volume_24h"] = _f(ticker.get("quoteVolume"), None) if pair else None
             coin["binance_spot_change_24h_pct"] = _f(ticker.get("priceChangePercent"), None) if pair else None
 
+        local_breadth = _compute_local_breadth(top100)
+        log.info(
+            "local_analysis breadth status=%s assets=%s positive_pct=%s median_24h=%s above_btc=%s",
+            local_breadth.get("status"), local_breadth.get("assets"), local_breadth.get("positive_pct"),
+            local_breadth.get("median_change_24h_pct"), local_breadth.get("above_btc_24h_pct"),
+        )
+        log.info(
+            "local_analysis 15m crypto_ok=%s/%s commodity_ok=%s/%s spot_depth_ok=%s/%s",
+            sum(1 for row in spot_details.values() if isinstance(row, dict) and row.get("15m_status") == "ok"), len(spot_details),
+            sum(1 for row in commodities.values() if isinstance(row, dict) and row.get("15m_status") == "ok"), len(commodities),
+            sum(1 for row in spot_liquidity.values() if row.get("status") == "ok"), len(spot_liquidity),
+        )
+
         return {
             "snapshot_time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "top100": top100,
@@ -712,6 +953,8 @@ async def fetch_market_bundle() -> dict[str, Any]:
             "pre_screen_short": short_pre,
             "crypto_technicals": spot_details,
             "crypto_derivatives": derivatives,
+            "crypto_spot_liquidity": spot_liquidity,
+            "local_breadth": local_breadth,
             "crypto_news": crypto_news,
             "commodities": commodities,
             "commodity_news": commodity_news,
@@ -722,6 +965,10 @@ async def fetch_market_bundle() -> dict[str, Any]:
                 "binance_spot": "ok",
                 "funding": derivative_sources.get("funding", "unavailable"),
                 "mexc_futures": derivative_sources.get("mexc_futures", "unavailable"),
+                "mexc_commodities": "ok" if all(isinstance(row, dict) and "1d" in row for row in commodities.values()) else "partial_or_unavailable",
+                "local_macro_dxy_us10y": "not_collected",
+                "spot_depth": "ok" if any(row.get("status") == "ok" for row in spot_liquidity.values()) else "unavailable",
+                "breadth": local_breadth.get("status", "unavailable"),
                 "calendar": calendar_status,
                 "news_filter": "enabled" if ENABLE_NEWS_FILTER else "disabled",
             },
@@ -740,10 +987,17 @@ def _history_bar_from_binance(row: list[Any], now_ms: int) -> dict[str, Any]:
     }
 
 
-def _history_bars_from_yahoo(payload: dict[str, Any], now_ts: float) -> list[dict[str, Any]]:
-    rows = _yahoo_rows(payload)
+def _history_bars_from_mexc(payload: dict[str, Any], now_ts: float) -> list[dict[str, Any]]:
+    """Convert MEXC Futures Min60 klines to completed 1H signal-history bars."""
+    cutoff_ms = int((int(now_ts) // 3600) * 3600 * 1000)
+    rows = _mexc_kline_rows(
+        payload,
+        interval_seconds=3600,
+        cutoff_ms=cutoff_ms,
+        max_rows=2000,
+    )
     bars: list[dict[str, Any]] = []
-    for index, row in enumerate(rows):
+    for row in rows:
         open_time = float(row[0]) / 1000.0
         close_time = open_time + 3600.0
         bars.append({
@@ -753,20 +1007,18 @@ def _history_bars_from_yahoo(payload: dict[str, Any], now_ts: float) -> list[dic
             "high": float(row[2]),
             "low": float(row[3]),
             "close": float(row[4]),
-            # Yahoo may expose the current partial hourly candle. Treat it as
-            # closed only after its nominal hour has elapsed.
             "closed": close_time <= now_ts,
         })
     return bars
 
 
 async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Fetch lightweight 1H history for v008 signal statistics.
+    """Fetch lightweight 1H history for v017 signal statistics.
 
-    Crypto outcomes are measured on Binance Spot only. Commodity outcomes use
-    the exact Yahoo symbol that generated the published setup. No Futures API is
-    involved. The history starts from the signal's issue hour and is capped by
-    the 14-day strategy horizon.
+    Crypto outcomes are measured on Binance Spot. Commodity outcomes use the
+    same MEXC Futures contract that generated the published XAU/XAG/USOIL setup.
+    The history starts from the signal's issue hour and is capped by the 14-day
+    strategy horizon.
     """
     open_records = [
         row for row in records
@@ -779,10 +1031,14 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
     now_ms = int(now_ts * 1000)
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v008)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v017)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     sem = asyncio.Semaphore(6)
+    # Keep MEXC signal-history checks deliberately conservative. The generic
+    # history semaphore caps all sources; this dedicated limiter prevents a
+    # burst of pending commodity records from hitting MEXC Futures at once.
+    mexc_history_sem = asyncio.Semaphore(2)
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
         async def fetch_one(record: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | None]:
@@ -790,6 +1046,10 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
             issued_at = float(record.get("issued_at") or now_ts)
             start_hour = int(issued_at // 3600) * 3600
             source_symbol = str(record.get("source_symbol") or "").strip()
+            if record.get("market") == "commodity":
+                # Migrate pending legacy commodity records transparently: v017 always
+                # evaluates commodity outcomes on the current MEXC contract.
+                source_symbol = COMMODITY_SYMBOLS.get(str(record.get("asset") or ""), source_symbol)
             if not source_symbol:
                 return record_id, None
             async with sem:
@@ -810,19 +1070,18 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
                         bars = [_history_bar_from_binance(row, now_ms) for row in payload if isinstance(row, list) and len(row) >= 7]
                         return record_id, bars
 
-                    payload = await _get_json(
-                        client,
-                        f"{YAHOO_CHART_BASE}/{source_symbol}",
-                        params={
-                            "interval": "1h",
-                            "period1": start_hour,
-                            "period2": int(now_ts) + 3600,
-                            "includePrePost": "false",
-                            "events": "div,splits",
-                        },
-                        attempts=2,
-                    )
-                    bars = [bar for bar in _history_bars_from_yahoo(payload, now_ts) if bar["open_time"] >= start_hour]
+                    async with mexc_history_sem:
+                        payload = await _get_json(
+                            client,
+                            f"{MEXC_CONTRACT_BASE}/api/v1/contract/kline/{source_symbol}",
+                            params={
+                                "interval": "Min60",
+                                "start": start_hour,
+                                "end": int(now_ts),
+                            },
+                            attempts=2,
+                        )
+                    bars = [bar for bar in _history_bars_from_mexc(payload, now_ts) if bar["open_time"] >= start_hour]
                     return record_id, bars
                 except Exception as exc:
                     log.info("Signal history unavailable id=%s asset=%s: %s", record_id, record.get("asset"), exc)

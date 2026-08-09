@@ -1,0 +1,16 @@
+{
+  "version": "v017",
+  "compileall": "PASS",
+  "ast_parse": "PASS",
+  "duplicate_definition_scan": "PASS",
+  "mexc_default_domain_config": "PASS:https://api.mexc.com",
+  "mexc_default_domain_market_data": "PASS:https://api.mexc.com",
+  "old_contract_mexc_runtime_domain_absent": "PASS",
+  "signal_history_global_limiter": "PASS",
+  "signal_history_mexc_dedicated_limiter": "PASS:max_concurrency_2",
+  "crypto_signal_history_stays_binance": "PASS",
+  "collector_unchanged_sha256": "4433e8e4f0d7a3e78f30d786321f858b91b9fa37e8739dac04d5cb6729444fd1",
+  "version_consistency": "PASS",
+  "zip_integrity": "PASS",
+  "live_external_api_test": "NOT_RUN"
+}

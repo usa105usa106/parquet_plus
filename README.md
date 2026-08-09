@@ -1,6 +1,20 @@
-# Coolify Trading + Market Data Bot v008
+# Coolify Trading + Market Data Bot v017
 
 Бесплатный Telegram-бот без OpenAI API. Есть два независимых режима: **Анализ** — бот сам делает свежий рыночный анализ и выдаёт компактный финальный вердикт; **Parquet** — бот не выбирает LONG/SHORT, а только собирает свежие сырые данные, отправляет ZIP в Telegram и затем те же байты в Gmail как `.zip.jpg` для анализа в другой среде ChatGPT.
+
+## v017: актуальный MEXC Futures API domain + безопасный history limiter
+
+По сравнению с предыдущим релизом изменены только инфраструктурные детали MEXC Futures: default-домен обновлён на `https://api.mexc.com`, а проверка истории незавершённых сырьевых сигналов дополнительно ограничена двумя одновременными MEXC-запросами. Пути API, формат Parquet, Gmail, таймер и мастер-промпт не менялись по логике.
+
+Локальная кнопка **Анализ** усилена без изменения Parquet/Gmail/таймера. Для крипто используются до **365 закрытых 1D**, 4H/1H и до **288 закрытых 15m** свечей; неполная 1D-история нового листинга сохраняется как `PARTIAL_HISTORY`. 15m — только подтверждение входа и при недоступности не ломает скан.
+
+Используются лёгкие подтверждающие слои: breadth top-100, Binance Spot depth для компактного shortlist, MEXC funding/basis/futures-vs-spot divergence и crypto regime по общему рынку/BTC dominance. Spot depth запрашивается до 500 уровней и влияет на score только при фактическом покрытии обеих границ ±0.5%. `READY` требует согласования 1D/4H, 15m-подтверждения и отсутствия входа из середины диапазона; близкое ключевое событие переводит `READY` в ожидание.
+
+**Yahoo полностью удалён из локального анализа.** XAU/XAG/USOIL берутся напрямую из MEXC Futures: `XAU_USDT`, `SILVER_USDT`, `USOIL_USDT`; используются нативные закрытые `Day1`, `Hour4`, `Min60`, `Min15`. Yahoo fallback нет. DXY/US10Y локально больше не запрашиваются; их прежний небольшой вес становится нулевым, а режим крипторынка остаётся на общем рынке и BTC dominance. Для полностью плоского ряда RSI считается нейтральным `50`.
+
+Для каждого реально выбранного актива финальный локальный вердикт показывает `Отработка: N%`. Это **расчётная эвристическая оценка текущего сетапа при выполнении условия входа**, а не исторический winrate и не гарантия результата. Процент переводится из итогового composite score один раз — подтверждения не добавляются повторно.
+
+Все новые локальные слои и выбранные `score/status/Отработка` пишутся в root log и видны через `/log_full`. Отказ 15m, depth или отдельного enrichment-источника не должен ломать основной 1D/4H/1H анализ.
 
 Никакого candle cache: каждый запуск получает данные заново.
 
@@ -26,36 +40,61 @@
 
 ## Анализ
 
-Локальный алгоритм без LLM/API использует Binance Spot для крипто-техники и ликвидности, MEXC Futures как источник funding и бесплатные публичные источники для market/macro context. Результат — только `ФИНАЛЬНЫЙ ВЕРДИКТ · v008`.
+Локальный алгоритм без LLM/API использует Binance Spot 1D/4H/1H/15m, market breadth, компактный Spot order book, MEXC funding/basis/futures context, календарь ключевых событий и RSS/news. XAU/XAG/USOIL полностью анализируются по MEXC Futures на 1D/4H/1H/15m; Yahoo не используется. Результат — только `ФИНАЛЬНЫЙ ВЕРДИКТ · v017` с расчётной строкой `Отработка: N%` у каждого выбранного актива.
 
 ## Parquet
 
-### Crypto
+### Crypto timeframes
 
-Бот формирует 100 наиболее капитализированных non-stable/non-wrapped активов, для которых есть активная Binance Spot `USDT` пара. Все stablecoin-кандидаты исключаются централизованным фильтром: типовые USD/EUR-тикеры (включая новые варианты вроде `RLUSD`/`BFUSD`) плюс отдельный список stablecoin-тикеров без `USD/EUR` в названии. По каждому загружается до **999 полностью закрытых 1H свечей**. Если актив недавно появился на Binance Spot и закрытых свечей меньше, он **не исключается**: сохраняется вся доступная история и ставится `PARTIAL_HISTORY`. Текущая незакрытая 1H-свеча исключена. В Parquet сохраняются OHLC, base/quote volume, число сделок и taker-buy volume.
+Бот формирует 100 наиболее капитализированных non-stable/non-wrapped активов с активной Binance Spot `USDT` парой. Для каждого собираются только полностью закрытые свечи:
 
-### MEXC funding
+- до **999 × 1H** (~41.6 дня);
+- до **365 × 1D**;
+- до **288 × 15m** (последние 3 дня).
 
-Для каждого из 100 криптоактивов бот пытается найти соответствующий MEXC Futures perpetual. Сохраняются current funding и последние 30 funding settlements. Если контракта нет — `NOT_ON_MEXC`. Binance Futures не используется.
+Для нового листинга короткая история допустима и помечается `PARTIAL_HISTORY`. Это относится и к 1D: если у тикера есть, например, только 80 или 200 закрытых дневных свечей, тикер **не исключается** и не заменяется другим — в архив попадает вся доступная история до лимита 365. 4H в последующем анализе строится из 1H.
+
+### Market breadth и Binance Spot liquidity
+
+`market_breadth.parquet` рассчитывается локально по top-100: advance/decline, positive breadth, median returns, доля активов выше SMA20/50/200 1D, relative breadth к BTC, новые 20D high/low.
+
+`binance_spot_liquidity.parquet` содержит свежий snapshot стакана Binance Spot: spread, depth и imbalance в диапазонах ±0.1%, ±0.5% и ±1.0%, плюс фактическое покрытие полученных уровней.
+
+### MEXC Futures
+
+`funding_mexc.parquet` сохраняет current funding и последние 30 funding settlements. `mexc_derivatives.parquet` добавляет current `holdVol`/OI, last/fair/index, basis, funding, 24h futures volume и bid/ask. Binance Futures не используется.
+
+### BTC/ETH options
+
+Deribit public API используется без торговых ключей как **необязательный enrichment-слой**. Если Deribit отвечает, `options_deribit.parquet` хранит snapshot активной BTC/ETH option-chain, а `options_regime.parquet` — компактный regime: put/call OI/volume, ATM IV около 7/30/60 дней и DVOL. Если Deribit не отвечает или возвращает непригодные данные, сбор архива не падает: options пропускаются, остальные данные и ZIP формируются как обычно.
 
 ### XAU / XAG / USOIL
 
-MEXC Futures: `XAU_USDT`, `SILVER_USDT`, `USOIL_USDT`, до 999 полностью закрытых 1H-свечей на инструмент.
+MEXC Futures: `XAU_USDT`, `SILVER_USDT`, `USOIL_USDT`. Для каждого также собираются до 999×1H, 365×1D и 288×15m закрытых свечей.
 
 ## Состав ZIP
 
 ```text
 market_scan_YYYYMMDD_HHMMSS.zip
-├── crypto_ohlcv.parquet
-├── commodities_ohlcv.parquet
+├── crypto_ohlcv_1h.parquet
+├── crypto_ohlcv_1d.parquet
+├── crypto_ohlcv_15m.parquet
+├── commodities_ohlcv_1h.parquet
+├── commodities_ohlcv_1d.parquet
+├── commodities_ohlcv_15m.parquet
+├── market_breadth.parquet
+├── binance_spot_liquidity.parquet
 ├── funding_mexc.parquet
+├── mexc_derivatives.parquet
+├── options_deribit.parquet      # только если Deribit доступен
+├── options_regime.parquet       # только если Deribit доступен
 ├── universe.parquet
 ├── PROMPT_FOR_CHATGPT.txt
 ├── manifest.json
 └── status.json
 ```
 
-`PROMPT_FOR_CHATGPT.txt` содержит полный мастер-промпт. Он прямо сообщает, что бот только собрал данные и не выбирал кандидатов, требует построить 4H/1D из 1H, проверить свежий внешний контекст и пользователю вывести только компактный `ФИНАЛЬНЫЙ ВЕРДИКТ`, без промежуточной болтовни.
+`PROMPT_FOR_CHATGPT.txt` требует анализировать 1D → 4H → 1H → 15m, derivatives/liquidity/breadth, а BTC/ETH options — только если соответствующие файлы реально есть в архиве. Перед финальным вердиктом обязательно проверяется через свежий интернет макро, новости, token unlocks, регуляторные события и геополитическая/военная эскалация. В финальном блоке LONG/SHORT, тикеры и все числовые значения выделяются жирным; для действительно исключительного сигнала разрешена отдельная строка `**ВНИМАНИЕ! ПОВЫШЕННАЯ ПРОХОДИМОСТЬ!**`.
 
 ## Telegram → Gmail
 
@@ -68,15 +107,15 @@ market_scan_YYYYMMDD_HHMMSS.zip
 
 ## Почта / Gmail
 
-В v008 основной способ подключения — **быстрый импорт уже существующей Gmail-сессии**. Нажмите **Почта** и отправьте одной строкой Base64-экспорт из старого бота. Сообщение с экспортом бот сразу удаляет, расшифровывает данные только в памяти и проверяет Google-сессию без отправки тестового письма.
+В v017 основной способ подключения — **быстрый импорт уже существующей Gmail-сессии**. Нажмите **Почта** и отправьте одной строкой Base64-экспорт из старого бота. Сообщение с экспортом бот сразу удаляет, расшифровывает данные только в памяти и проверяет Google-сессию без отправки тестового письма.
 
 Импортированная авторизация **сессионная**: Client ID/Secret, refresh token, access token и Fernet key из импорта не записываются на диск и исчезают после restart/redeploy нового бота. После redeploy достаточно снова нажать **Почта** и отправить ту же строку. Старый бот при этом не изменяется и его OAuth-доступ не отзывается.
 
-Google OAuth/callback в v008 не используется: кнопка **Почта** работает только через импорт сохранённой сессии.
+Google OAuth/callback в v017 не используется: кнопка **Почта** работает только через импорт сохранённой сессии.
 
 ## Полный лог
 
-Команда `/log_full` присылает журнал всех основных операций текущего бота: входящие команды/кнопки, запуск и завершение анализа/Parquet, стадии сборки, таймеры, Telegram/Gmail delivery, Gmail OAuth-аудит и ошибки.
+Команда `/log_full` присылает журнал всех основных операций текущего бота: входящие команды/кнопки, запуск и завершение анализа/Parquet, стадии сборки, таймеры, Telegram/Gmail delivery, Gmail OAuth-аудит и ошибки. Для локального анализа дополнительно логируются 15m coverage, breadth, shortlist Spot depth и выбранные asset/direction/status/score/`completion_pct`. Для Market Scan логируются состав top-100, покрытие и `PARTIAL_HISTORY` для 1H/1D/15m, Binance Spot depth/liquidity, market breadth, MEXC funding, OI/basis, XAU/XAG/USOIL по таймфреймам, доступность BTC/ETH options, а также итоговый размер/SHA-256/время сборки ZIP.
 
 Секретные значения в журнал не передаются: содержимое Gmail import, Client Secret, access/refresh tokens, Bearer Authorization, Fernet key/token и Telegram bot token не логируются либо автоматически редактируются. Обычные произвольные текстовые сообщения также записываются только как факт получения и длина, без текста.
 
@@ -94,4 +133,4 @@ TELEGRAM_BOT_TOKEN=...
 
 ## Status
 
-`/status` показывает v008, текущее действие, таймер и следующее выполнение, статистику самостоятельного анализа, последний Parquet, размер ZIP, покрытие Binance Spot/MEXC funding/XAU-XAG-USOIL, Gmail status и память процесса.
+`/status` показывает v017, текущее действие, таймер и следующее выполнение, статистику самостоятельного анализа, последний Parquet, размер ZIP, покрытие Binance Spot/MEXC funding/XAU-XAG-USOIL, Gmail status и память процесса.

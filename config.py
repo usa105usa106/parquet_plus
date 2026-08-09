@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-APP_VERSION = "v008"
+APP_VERSION = "v017"
 
 
 def _normalize_public_base_url(value: str) -> str:
@@ -74,7 +74,11 @@ class Settings:
     mexc_contract_base_url: str
     coinpaprika_base_url: str
     coingecko_base_url: str
+    deribit_base_url: str
     candle_limit: int
+    daily_candle_limit: int
+    m15_candle_limit: int
+    binance_depth_limit: int
     funding_history_count: int
     secret_encryption_key: str | None
     gmail_client_id: str
@@ -135,10 +139,14 @@ def load_settings() -> Settings:
         scan_cooldown_seconds=max(0, int(os.getenv("SCAN_COOLDOWN_SECONDS", "20"))),
         user_timezone=os.getenv("USER_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
         binance_spot_base_url=os.getenv("BINANCE_SPOT_BASE_URL", "https://api.binance.com").strip().rstrip("/"),
-        mexc_contract_base_url=os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com").strip().rstrip("/"),
+        mexc_contract_base_url=os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.com").strip().rstrip("/"),
         coinpaprika_base_url=os.getenv("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1").strip().rstrip("/"),
         coingecko_base_url=os.getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3").strip().rstrip("/"),
+        deribit_base_url=os.getenv("DERIBIT_BASE_URL", "https://www.deribit.com/api/v2").strip().rstrip("/"),
         candle_limit=999,
+        daily_candle_limit=365,
+        m15_candle_limit=288,
+        binance_depth_limit=max(100, min(1000, int(os.getenv("BINANCE_DEPTH_LIMIT", "500")))),
         funding_history_count=max(0, min(1000, int(os.getenv("MEXC_FUNDING_HISTORY_COUNT", "30")))),
         secret_encryption_key=(
             os.getenv("SECRET_ENCRYPTION_KEY", "").strip()
