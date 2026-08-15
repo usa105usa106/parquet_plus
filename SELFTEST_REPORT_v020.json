@@ -1,0 +1,20 @@
+{
+  "version": "v020",
+  "live_external_apis_tested": false,
+  "checks": {
+    "compileall": "PASS",
+    "ast_parse": "PASS",
+    "duplicate_top_level": "PASS",
+    "telegram_connect_retry_synthetic": "PASS",
+    "telegram_connect_retry_exhaustion": "PASS",
+    "telegram_uncertain_timeout_no_retry": "PASS",
+    "telegram_progress_no_retry": "PASS",
+    "analysis_delivery_retry_wiring": "PASS",
+    "parquet_delivery_retry_wiring": "PASS",
+    "auto_loop_networkerror_survives": "PASS",
+    "collector_unchanged": "PASS",
+    "analysis_market_logic_version_only": "PASS",
+    "old_version_absent": "PASS",
+    "zip_crc": "PASS"
+  }
+}

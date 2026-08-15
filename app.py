@@ -6,6 +6,8 @@ import logging
 import math
 import os
 import time
+
+import httpx
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -19,6 +21,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -64,6 +67,9 @@ SCORE_S_MIN = 0.0
 SCORE_S_MAX = 30.0
 FULL_LOG_HOURS = 24
 
+TELEGRAM_CONNECT_TIMEOUT_SECONDS = 5.0
+TELEGRAM_RETRY_DELAYS_SECONDS: tuple[float, ...] = (2.0, 3.0)
+
 
 def _validated_commodity_score(value: Any) -> float:
     try:
@@ -77,11 +83,75 @@ def _validated_commodity_score(value: Any) -> float:
 def _score_text(value: float) -> str:
     return f"{float(value):.3f}".rstrip("0").rstrip(".")
 
+
+def _is_connect_failure(exc: BaseException) -> bool:
+    """Return True only when Telegram failed before an HTTP request was established."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.ConnectTimeout, httpx.ConnectError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _telegram_progress_once(operation: str, call_factory: Any) -> Any | None:
+    """Best-effort Telegram UI update. Never block the scan with retries."""
+    try:
+        return await call_factory()
+    except TelegramError as exc:
+        log.warning(
+            "telegram_progress_skipped operation=%s error_type=%s error=%s",
+            operation, type(exc).__name__, exc,
+        )
+        return None
+
+
+async def _telegram_delivery_with_retry(operation: str, call_factory: Any) -> Any | None:
+    """Retry confirmed Telegram connect failures after 2s and 3s, then skip delivery.
+
+    Read/write timeouts are not retried because Telegram may already have accepted
+    the message/file, and retrying an uncertain delivery could create duplicates.
+    """
+    attempts = 1 + len(TELEGRAM_RETRY_DELAYS_SECONDS)
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await call_factory()
+            if attempt > 1:
+                log.info(
+                    "telegram_delivery_recovered operation=%s attempt=%s/%s",
+                    operation, attempt, attempts,
+                )
+            return result
+        except NetworkError as exc:
+            if not _is_connect_failure(exc):
+                log.error(
+                    "telegram_delivery_uncertain operation=%s attempt=%s/%s error_type=%s; no retry to avoid duplicate",
+                    operation, attempt, attempts, type(exc).__name__,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                return None
+            if attempt >= attempts:
+                log.error(
+                    "telegram_delivery_skipped operation=%s attempts=%s error_type=%s",
+                    operation, attempts, type(exc).__name__,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                return None
+            delay = TELEGRAM_RETRY_DELAYS_SECONDS[attempt - 1]
+            log.warning(
+                "telegram_connect_retry operation=%s attempt=%s/%s retry_in_sec=%.1f error_type=%s",
+                operation, attempt, attempts, delay, type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
+    return None
+
 BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
 
-# Callback ids from older builds. v019 never launches OAuth/callback setup.
+# Callback ids from older builds. v020 never launches OAuth/callback setup.
 STALE_GMAIL_CALLBACKS = {
     "gmail_check",
     "gmail_config",
@@ -481,7 +551,14 @@ async def _progress_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
     holder["last_edit"] = now
     msg = holder.get("message")
     if msg is None:
-        holder["message"] = await context.bot.send_message(chat_id=chat_id, text=f"⏳ {text}")
+        holder["message"] = await _telegram_progress_once(
+            "parquet progress",
+            lambda: context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏳ {text}",
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+            ),
+        )
         return
     try:
         await msg.edit_text(f"⏳ {text}")
@@ -513,19 +590,35 @@ async def _send_archive_then_gmail(
     )
 
     telegram_name = path.name
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    with path.open("rb") as fh:
-        sent = await context.bot.send_document(
+    await _telegram_progress_once(
+        "parquet upload action",
+        lambda: context.bot.send_chat_action(
             chat_id=chat_id,
-            document=fh,
-            filename=telegram_name,
-            caption=(
-                f"Market Scan {BOT_VERSION} · 999×1H + 365×1D + 288×15m\n"
-                f"Binance Spot: {result.binance_full_count}/100 полных 1H · "
-                f"MEXC funding: {result.mexc_funding_coverage}/100 · commodities: {result.commodities_ok_count}/3\n"
-                "ZIP: breadth + Spot depth + MEXC OI/basis/funding + BTC/ETH options + prompt."
-            ),
-        )
+            action=ChatAction.UPLOAD_DOCUMENT,
+            connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+        ),
+    )
+
+    async def _send_archive_once() -> Any:
+        with path.open("rb") as fh:
+            return await context.bot.send_document(
+                chat_id=chat_id,
+                document=fh,
+                filename=telegram_name,
+                caption=(
+                    f"Market Scan {BOT_VERSION} · 999×1H + 365×1D + 288×15m\n"
+                    f"Binance Spot: {result.binance_full_count}/100 полных 1H · "
+                    f"MEXC funding: {result.mexc_funding_coverage}/100 · commodities: {result.commodities_ok_count}/3\n"
+                    "ZIP: breadth + Spot depth + MEXC OI/basis/funding + BTC/ETH options + prompt."
+                ),
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+            )
+
+    sent = await _telegram_delivery_with_retry("parquet archive", _send_archive_once)
+    if sent is None:
+        log.error("archive_delivery skipped chat_id=%s filename=%s reason=telegram_connect_failed", chat_id, telegram_name)
+        return "TELEGRAM_FAILED"
+
     delivered_name = getattr(getattr(sent, "document", None), "file_name", None) or telegram_name
     if delivered_name != telegram_name:
         raise RuntimeError(f"Telegram изменил имя файла: {delivered_name} != {telegram_name}")
@@ -578,7 +671,14 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
         semaphore_acquired = False
         try:
             if show_progress:
-                progress = await application.bot.send_message(chat_id=chat_id, text="⏳ Сканирую рынок…")
+                progress = await _telegram_progress_once(
+                    "analysis progress",
+                    lambda: application.bot.send_message(
+                        chat_id=chat_id,
+                        text="⏳ Сканирую рынок…",
+                        connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                    ),
+                )
             await runtime.scan_semaphore.acquire()
             semaphore_acquired = True
             bundle = await fetch_market_bundle()
@@ -603,25 +703,36 @@ async def _perform_analysis(application: Application, chat_id: int, *, show_prog
                     signal.completion_pct, signal.rr,
                 )
             await _safe_delete(progress)
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=verdict,
-                parse_mode="HTML",
-                reply_markup=_keyboard(runtime, chat_id),
+            delivered = await _telegram_delivery_with_retry(
+                "analysis verdict",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=verdict,
+                    parse_mode="HTML",
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
             )
+            if delivered is None:
+                log.error("analysis delivery skipped chat_id=%s; current round result discarded", chat_id)
+                return
             register_selected_signals(stats, selected, bundle, now_ts=time.time())
             state["signal_stats"] = stats
             log.info("Completed self-analysis chat_id=%s", chat_id)
         except Exception as exc:  # noqa: BLE001
             log.exception("Self-analysis failed chat=%s", chat_id)
             await _safe_delete(progress)
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Сканирование не удалось. Старые сигналы не подставляю.\n"
-                    f"Ошибка источника данных: {type(exc).__name__}."
+            await _telegram_delivery_with_retry(
+                "analysis error",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "Сканирование не удалось. Старые сигналы не подставляю.\n"
+                        f"Ошибка источника данных: {type(exc).__name__}."
+                    ),
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
                 ),
-                reply_markup=_keyboard(runtime, chat_id),
             )
         finally:
             if semaphore_acquired:
@@ -651,7 +762,14 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
         semaphore_acquired = False
         try:
             if show_progress:
-                holder["message"] = await application.bot.send_message(chat_id=chat_id, text="⏳ Собираю свежий Parquet без кэша…")
+                holder["message"] = await _telegram_progress_once(
+                    "parquet progress start",
+                    lambda: application.bot.send_message(
+                        chat_id=chat_id,
+                        text="⏳ Собираю свежий Parquet без кэша…",
+                        connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                    ),
+                )
                 holder["last_edit"] = time.monotonic()
             await runtime.scan_semaphore.acquire()
             semaphore_acquired = True
@@ -680,6 +798,9 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
             gmail_status = await _send_archive_then_gmail(application, chat_id, runtime, result)  # type: ignore[arg-type]
             state["last_gmail_status"] = gmail_status
             runtime.save_state()
+            if gmail_status == "TELEGRAM_FAILED":
+                log.error("parquet delivery skipped chat_id=%s; current round result discarded", chat_id)
+                return
 
             if gmail_status == "SENT":
                 follow = "📧 Следом отправлено в Gmail как .zip.jpg."
@@ -689,29 +810,41 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
                 follow = f"♻️ Gmail повтор заблокирован: {gmail_status}."
             else:
                 follow = f"⚠️ Gmail: {gmail_status}."
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"✅ Parquet собран за {_elapsed(result.duration_seconds)}. {follow}\n"
-                    f"Архив: {_human_bytes(result.archive_size_bytes)} · SHA-256 {result.archive_sha256[:12]}…"
+            await _telegram_delivery_with_retry(
+                "parquet summary",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ Parquet собран за {_elapsed(result.duration_seconds)}. {follow}\n"
+                        f"Архив: {_human_bytes(result.archive_size_bytes)} · SHA-256 {result.archive_sha256[:12]}…"
+                    ),
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
                 ),
-                reply_markup=_keyboard(runtime, chat_id),
             )
         except (GmailAttachmentTooLarge, GmailArchiveChanged, GmailSendUncertain, GmailOAuthError) as exc:
             log.exception("Gmail delivery failed chat=%s", chat_id)
             state["last_gmail_status"] = f"ERROR:{type(exc).__name__}"
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ ZIP в Telegram отправлен, но Gmail завершился ошибкой: {exc}",
-                reply_markup=_keyboard(runtime, chat_id),
+            await _telegram_delivery_with_retry(
+                "parquet gmail error",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ ZIP в Telegram отправлен, но Gmail завершился ошибкой: {exc}",
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Market parquet build failed chat=%s", chat_id)
             await _safe_delete(holder.get("message"))
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Parquet не собран: {type(exc).__name__}: {str(exc)[:500]}",
-                reply_markup=_keyboard(runtime, chat_id),
+            await _telegram_delivery_with_retry(
+                "parquet error",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Parquet не собран: {type(exc).__name__}: {str(exc)[:500]}",
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
             )
         finally:
             if semaphore_acquired:
@@ -777,6 +910,11 @@ async def _auto_loop(application: Application, chat_id: int) -> None:
                     await _perform_analysis(application, chat_id, show_progress=False)
                 else:
                     await _perform_parquet(application, chat_id, show_progress=False)
+            except NetworkError as exc:
+                log.warning(
+                    "timer telegram network error swallowed chat_id=%s action=%s error_type=%s",
+                    chat_id, action, type(exc).__name__,
+                )
             finally:
                 runtime.auto_scanning.discard(chat_id)
     except asyncio.CancelledError:

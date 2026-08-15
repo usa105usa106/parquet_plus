@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Coolify Trading Signal Bot v019
+# Coolify Trading Signal Bot v020
 
 import asyncio
 import logging
@@ -46,7 +46,7 @@ COMMODITY_SYMBOLS = {
     "USOIL": "USOIL_USDT",
 }
 
-# v019 local commodity candles come directly from MEXC Futures. DXY/US10Y are
+# v020 local commodity candles come directly from MEXC Futures. DXY/US10Y are
 # not fetched locally; the crypto regime remains based on broad crypto data and BTC dominance.
 
 IMPORTANT_EVENT_KEYWORDS = (
@@ -180,7 +180,7 @@ def rsi(values: list[float], period: int = 14) -> float | None:
 
 
 def _technical_from_rows(rows: list[list[Any]], interval: str) -> dict[str, Any]:
-    # v019: keep younger listings usable instead of requiring a full 365D
+    # v020: keep younger listings usable instead of requiring a full 365D
     # history. Twenty-one closed bars are enough for a cautious partial view;
     # EMA50/EMA200 simply remain unavailable until enough history exists.
     if len(rows) < 21:
@@ -379,7 +379,7 @@ async def _fetch_binance_spot_details(
 ) -> dict[str, dict[str, Any]]:
     """Fetch closed Binance Spot candles for the local analyzer.
 
-    v019 requests up to 365 closed 1D candles and 288 closed 15m candles.
+    v020 requests up to 365 closed 1D candles and 288 closed 15m candles.
     A shorter 1D history is retained as PARTIAL_HISTORY; it is never rejected
     merely because the listing is younger than 365 days. 15m is optional: if
     that single request fails the 1D/4H/1H core remains usable.
@@ -530,7 +530,7 @@ async def _fetch_mexc_derivatives(
     """Fetch MEXC perpetual funding in one public/no-auth request.
 
     MEXC's all-contract ticker includes fundingRate, 24h move/turnover and holdVol.
-    In v019 MEXC is the only funding source; Binance Futures is not queried.
+    In v020 MEXC is the only funding source; Binance Futures is not queried.
     """
     try:
         payload = await _get_json(
@@ -599,7 +599,7 @@ async def _fetch_derivatives(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Fetch derivatives context from MEXC only.
 
-    Funding is intentionally MEXC-only in v019. Binance Futures is not called at
+    Funding is intentionally MEXC-only in v020. Binance Futures is not called at
     all, so an unavailable Binance Futures API cannot delay or alter the scan.
     """
     mexc_rows, mexc_status = await _fetch_mexc_derivatives(client, symbols)
@@ -670,7 +670,7 @@ async def _fetch_mexc_commodity_asset(
 ) -> tuple[str, dict[str, Any]]:
     """Fetch native closed MEXC Futures candles for XAU/XAG/USOIL.
 
-    No alternate chart-provider fallback is used in v019. 1D is retained up to 365 bars, native 4H
+    No alternate chart-provider fallback is used in v020. 1D is retained up to 365 bars, native 4H
     and 1H are used directly, and 15m is best-effort entry confirmation.
     """
     now_ms = int(time.time() * 1000)
@@ -893,7 +893,7 @@ async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
     except Exception as exc:
         statuses.append(f"this_week_json:unavailable:{type(exc).__name__}")
 
-    # The old ff_calendar_nextweek.json URL returns 404. v019 instead parses
+    # The old ff_calendar_nextweek.json URL returns 404. v020 instead parses
     # Forex Factory's actual ?week=next page as an independent fallback layer.
     try:
         next_rows = await _fetch_next_week_calendar_page(client)
@@ -943,7 +943,7 @@ async def _fetch_calendar(client: httpx.AsyncClient) -> tuple[list[dict[str, Any
 async def fetch_market_bundle() -> dict[str, Any]:
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v019)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v020)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
@@ -1153,7 +1153,7 @@ def _history_bars_from_mexc(payload: dict[str, Any], now_ts: float) -> list[dict
 
 
 async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Fetch lightweight 1H history for v019 signal statistics.
+    """Fetch lightweight 1H history for v020 signal statistics.
 
     Crypto outcomes are measured on Binance Spot. Commodity outcomes use the
     same MEXC Futures contract that generated the published XAU/XAG/USOIL setup.
@@ -1171,7 +1171,7 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
     now_ms = int(now_ts * 1000)
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v019)",
+        "User-Agent": "Mozilla/5.0 (compatible; CoolifyTradingSignalBot/v020)",
     }
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=min(10.0, HTTP_TIMEOUT))
     sem = asyncio.Semaphore(6)
@@ -1187,7 +1187,7 @@ async def fetch_signal_histories(records: list[dict[str, Any]]) -> dict[str, lis
             start_hour = int(issued_at // 3600) * 3600
             source_symbol = str(record.get("source_symbol") or "").strip()
             if record.get("market") == "commodity":
-                # Migrate pending legacy commodity records transparently: v019 always
+                # Migrate pending legacy commodity records transparently: v020 always
                 # evaluates commodity outcomes on the current MEXC contract.
                 source_symbol = COMMODITY_SYMBOLS.get(str(record.get("asset") or ""), source_symbol)
             if not source_symbol:
