@@ -1,0 +1,25 @@
+{
+  "version": "v026",
+  "status": "PASS",
+  "checks": {
+    "compileall_ast": "PASS",
+    "version_v026_everywhere": "PASS",
+    "gmail_408_single_post_uncertain": "PASS",
+    "gmail_503_single_post_uncertain": "PASS",
+    "gmail_429_safe_retry_recovery": "PASS",
+    "gmail_429_retry_exhaustion": "PASS",
+    "gmail_ambiguous_network_no_retry_preserved": "PASS",
+    "manual_binance_7d_from_closed_1d": "PASS",
+    "manual_binance_7d_short_history_none": "PASS",
+    "status_last_successful_parquet_guard": "PASS",
+    "analysis_core_unchanged": "PASS",
+    "main_parquet_core_unchanged": "PASS",
+    "telegram_delivery_unchanged": "PASS",
+    "manual_commands_unchanged": "PASS",
+    "manual_archive_filename_and_gmail_jpg_unchanged": "PASS",
+    "top_candidate_depth_500_1000_unchanged": "PASS",
+    "scan_zip_cleanup_unchanged": "PASS"
+  },
+  "live_network_tests": false,
+  "local_dependency_note": "pyarrow/python-telegram-bot unavailable; unit test used minimal pyarrow stub"
+}

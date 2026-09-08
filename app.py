@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 
 import httpx
@@ -32,7 +33,7 @@ from telegram.ext import (
     filters,
 )
 
-from collector import ArchiveBuildResult, build_market_archive
+from collector import ArchiveBuildResult, build_manual_exchange_archive, build_market_archive
 from analyzer import DEFAULT_COMMODITY_SCORE, build_final_analysis
 from market_data import fetch_market_bundle, fetch_signal_histories
 from signal_stats import ensure_stats, reconcile_stats, register_selected_signals, summary as stats_summary
@@ -205,7 +206,7 @@ BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
 
-# Callback ids from older builds. v023 never launches OAuth/callback setup.
+# Callback ids from older builds. v026 never launches OAuth/callback setup.
 STALE_GMAIL_CALLBACKS = {
     "gmail_check",
     "gmail_config",
@@ -634,19 +635,23 @@ async def _progress_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
         pass
 
 
-def _cleanup_market_scan_archives(
+def _cleanup_scan_archives(
     exports_dir: Path,
     protected_paths: set[Path] | None = None,
 ) -> tuple[int, int]:
-    """Delete completed Market Scan ZIPs while preserving other active scans.
+    """Delete completed scan ZIPs while preserving other active scans.
 
     Cleanup is intentionally called only after both Telegram and Gmail delivery
-    are confirmed. Other export files (logs/reports) are never touched.
+    are confirmed. Only bot scan ZIP patterns are touched; other export files are not.
     """
     protected = {Path(item).resolve() for item in (protected_paths or set())}
     removed = 0
     failed = 0
-    for archive in sorted(Path(exports_dir).glob("market_scan_*.zip")):
+    archives: dict[Path, None] = {}
+    for pattern in ("market_scan_*.zip", "manual_scan_*.zip"):
+        for archive in Path(exports_dir).glob(pattern):
+            archives[archive] = None
+    for archive in sorted(archives):
         if not archive.is_file() or archive.resolve() in protected:
             continue
         try:
@@ -663,6 +668,10 @@ async def _send_archive_then_gmail(
     chat_id: int,
     runtime: Runtime,
     result: ArchiveBuildResult,
+    *,
+    telegram_caption: str | None = None,
+    gmail_subject_prefix: str | None = None,
+    operation_label: str = "parquet archive",
 ) -> str:
     path = result.archive_path
     log.info("archive_delivery started chat_id=%s filename=%s size=%s", chat_id, path.name, result.archive_size_bytes)
@@ -697,7 +706,7 @@ async def _send_archive_then_gmail(
                 chat_id=chat_id,
                 document=fh,
                 filename=telegram_name,
-                caption=(
+                caption=telegram_caption or (
                     f"Market Scan {BOT_VERSION} · 999×1H + 365×1D + 288×15m\n"
                     f"Binance Spot: {result.binance_full_count}/{result.universe_count} полных 1H · "
                     f"MEXC funding: {result.mexc_funding_coverage}/{result.universe_count} · commodities: {result.commodities_ok_count}/3\n"
@@ -706,7 +715,7 @@ async def _send_archive_then_gmail(
                 connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
             )
 
-    telegram_status, sent = await _telegram_archive_delivery_with_status("parquet archive", _send_archive_once)
+    telegram_status, sent = await _telegram_archive_delivery_with_status(operation_label, _send_archive_once)
     state = runtime.chat_state(chat_id)
     state["last_telegram_archive_status"] = telegram_status
     runtime.save_state()
@@ -741,7 +750,7 @@ async def _send_archive_then_gmail(
     log.info("archive_delivery gmail_started chat_id=%s filename=%s", chat_id, path.name)
     gmail_result = await runtime.gmail.send_archive(
         path,
-        subject_prefix=f"Market Scan {BOT_VERSION}",
+        subject_prefix=gmail_subject_prefix or f"Market Scan {BOT_VERSION}",
         expected_identity=identity,
         telegram_filename=delivered_name,
     )
@@ -753,7 +762,7 @@ async def _send_archive_then_gmail(
         if duplicate_status == "sent" and telegram_status == "CONFIRMED":
             protected = set(runtime.active_archive_paths) - {path}
             removed, failed = await asyncio.to_thread(
-                _cleanup_market_scan_archives, runtime.settings.exports_dir, protected
+                _cleanup_scan_archives, runtime.settings.exports_dir, protected
             )
             log.info("archive_cleanup completed removed=%s failed=%s trigger=gmail_ledger_sent", removed, failed)
             return "SENT_ALREADY" if failed == 0 else f"SENT_ALREADY_CLEANUP_PARTIAL:{failed}"
@@ -766,7 +775,7 @@ async def _send_archive_then_gmail(
     if telegram_status == "CONFIRMED":
         protected = set(runtime.active_archive_paths) - {path}
         removed, failed = await asyncio.to_thread(
-            _cleanup_market_scan_archives, runtime.settings.exports_dir, protected
+            _cleanup_scan_archives, runtime.settings.exports_dir, protected
         )
         log.info("archive_cleanup completed removed=%s failed=%s trigger=dual_confirmed", removed, failed)
         if failed:
@@ -891,6 +900,7 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
         log.info("parquet started chat_id=%s show_progress=%s top_limit=%s", chat_id, show_progress, top_limit)
         holder: dict[str, Any] = {}
         semaphore_acquired = False
+        parquet_built = False
         try:
             if show_progress:
                 holder["message"] = await _telegram_progress_once(
@@ -920,6 +930,7 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
             state["last_binance_partial_count"] = result.binance_partial_count
             state["last_mexc_funding_coverage"] = result.mexc_funding_coverage
             state["last_commodities_ok_count"] = result.commodities_ok_count
+            parquet_built = True
             runtime.save_state()
             log.info(
                 "parquet archive_built chat_id=%s filename=%s size=%s universe=%s binance_full=%s funding=%s commodities=%s",
@@ -1007,8 +1018,9 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
             state["last_completed_at"] = finished
             state["last_duration_seconds"] = duration
             state["last_action"] = "Parquet"
-            state["last_parquet_at"] = finished
-            state["last_parquet_duration_seconds"] = duration
+            if parquet_built:
+                state["last_parquet_at"] = finished
+                state["last_parquet_duration_seconds"] = duration
             runtime.save_state()
             log.info("parquet finished chat_id=%s duration_sec=%.3f", chat_id, duration)
 
@@ -1127,6 +1139,236 @@ async def analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def parquet_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _manual_action(update, context, "parquet")
+
+
+def _compact_symbol_text(symbols: list[str], max_chars: int = 700) -> str:
+    full = ",".join(symbols)
+    if len(full) <= max_chars:
+        return full
+    kept: list[str] = []
+    used = 0
+    for symbol in symbols:
+        extra = len(symbol) + (1 if kept else 0)
+        if used + extra > max_chars - 24:
+            break
+        kept.append(symbol)
+        used += extra
+    remaining = max(0, len(symbols) - len(kept))
+    return f"{','.join(kept)}… (+{remaining})"
+
+
+def _parse_manual_exchange_symbols(args: list[str] | tuple[str, ...] | None) -> list[str]:
+    raw = " ".join(args or []).strip()
+    if not raw:
+        return []
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for token in re.split(r"[,\s]+", raw):
+        symbol = token.strip().upper()
+        if not symbol:
+            continue
+        if not re.fullmatch(r"[A-Z0-9]{1,24}", symbol):
+            raise ValueError(f"Некорректный тикер: {token}")
+        if symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
+    return symbols
+
+
+async def _perform_manual_exchange_archive(
+    application: Application,
+    chat_id: int,
+    *,
+    exchange: str,
+    symbols: list[str],
+) -> None:
+    """Build a one-off exchange-only archive without changing timer/top state."""
+    runtime: Runtime = application.bot_data["runtime"]
+    lock = runtime.lock(chat_id)
+    exchange_label = "Binance Spot" if exchange == "binance" else "MEXC Futures"
+    symbol_text = ",".join(symbols)
+    display_symbols = _compact_symbol_text(symbols)
+    async with lock:
+        state = runtime.chat_state(chat_id)
+        state["scan_busy"] = True
+        runtime.save_state()
+        holder: dict[str, Any] = {}
+        semaphore_acquired = False
+        started = time.monotonic()
+        try:
+            holder["message"] = await _telegram_progress_once(
+                f"manual {exchange} progress start",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ Ручной {exchange_label}: {display_symbols}",
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
+            )
+            if holder.get("message") is not None:
+                holder["last_edit"] = time.monotonic()
+            await runtime.scan_semaphore.acquire()
+            semaphore_acquired = True
+
+            async def progress(text: str) -> None:
+                log.info(
+                    "manual_archive progress chat_id=%s exchange=%s symbols=%s stage=%s",
+                    chat_id, exchange, symbol_text, text,
+                )
+                await _progress_message(application, chat_id, text, holder)  # type: ignore[arg-type]
+
+            result = await build_manual_exchange_archive(
+                runtime.settings,
+                exchange=exchange,
+                symbols=symbols,
+                progress=progress,
+            )
+            runtime.active_archive_paths.add(result.archive_path)
+            holder["active_archive_path"] = result.archive_path
+            await _safe_delete(holder.get("message"))
+
+            if exchange == "binance":
+                caption = (
+                    f"Manual Binance Spot {BOT_VERSION} · {display_symbols}\n"
+                    "999×1H + 365×1D + 288×15m · Spot depth + breadth выбранного набора."
+                )
+                subject = f"Manual Binance Spot {BOT_VERSION}"
+            else:
+                caption = (
+                    f"Manual MEXC Futures {BOT_VERSION} · {display_symbols}\n"
+                    "999×1H + 365×1D + 288×15m · funding + OI/basis."
+                )
+                subject = f"Manual MEXC Futures {BOT_VERSION}"
+
+            gmail_status = await _send_archive_then_gmail(
+                application, chat_id, runtime, result,  # type: ignore[arg-type]
+                telegram_caption=caption,
+                gmail_subject_prefix=subject,
+                operation_label=f"manual {exchange} archive",
+            )
+            state["last_gmail_status"] = gmail_status
+            runtime.save_state()
+            if gmail_status == "TELEGRAM_FAILED":
+                return
+
+            if gmail_status in {"SENT", "SENT_ALREADY"}:
+                delivery_text = "Telegram и Gmail подтверждены; ZIP сканов на VPS очищены."
+            elif gmail_status.startswith("SENT_CLEANUP_PARTIAL") or gmail_status.startswith("SENT_ALREADY_CLEANUP_PARTIAL"):
+                delivery_text = f"Доставка подтверждена, но часть старых ZIP не удалилась: {gmail_status}."
+            elif gmail_status == "SENT_TELEGRAM_UNCERTAIN":
+                delivery_text = (
+                    "Gmail подтверждён; ответ Telegram был неопределённым, поэтому повтор ZIP не выполнялся "
+                    "и локальная копия сохранена до следующего полностью подтверждённого цикла."
+                )
+            elif gmail_status == "NOT_CONNECTED":
+                delivery_text = "ZIP отправлен в Telegram; Gmail не подключён."
+            elif gmail_status == "NOT_CONNECTED_TELEGRAM_UNCERTAIN":
+                delivery_text = "Ответ Telegram неопределённый; повтор не выполнялся, Gmail не подключён."
+            elif gmail_status.startswith("DUPLICATE"):
+                delivery_text = f"Повтор Gmail заблокирован: {gmail_status}."
+            else:
+                delivery_text = f"Gmail: {gmail_status}."
+
+            await _telegram_delivery_with_retry(
+                f"manual {exchange} summary",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ Ручной архив {exchange_label} собран: {display_symbols}.\n"
+                        f"{delivery_text}\n"
+                        f"Архив: {_human_bytes(result.archive_size_bytes)} · SHA-256 {result.archive_sha256[:12]}…"
+                    ),
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
+            )
+        except (GmailAttachmentTooLarge, GmailArchiveChanged, GmailSendUncertain, GmailOAuthError) as exc:
+            log.exception("Manual Gmail delivery failed chat=%s exchange=%s", chat_id, exchange)
+            state["last_gmail_status"] = f"ERROR:{type(exc).__name__}"
+            runtime.save_state()
+            await _telegram_delivery_with_retry(
+                f"manual {exchange} gmail error",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Ручной архив: Gmail завершился ошибкой: {exc}",
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "Manual exchange archive failed chat=%s exchange=%s symbols=%s",
+                chat_id, exchange, symbol_text,
+            )
+            await _safe_delete(holder.get("message"))
+            await _telegram_delivery_with_retry(
+                f"manual {exchange} error",
+                lambda: application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Ручной архив не собран: {type(exc).__name__}: {str(exc)[:500]}",
+                    reply_markup=_keyboard(runtime, chat_id),
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                ),
+            )
+        finally:
+            active_archive_path = holder.get("active_archive_path")
+            if isinstance(active_archive_path, Path):
+                runtime.active_archive_paths.discard(active_archive_path)
+            if semaphore_acquired:
+                runtime.scan_semaphore.release()
+            state["scan_busy"] = False
+            runtime.save_state()
+            log.info(
+                "manual_archive finished chat_id=%s exchange=%s symbols=%s duration_sec=%.3f",
+                chat_id, exchange, symbol_text, max(0.0, time.monotonic() - started),
+            )
+
+
+async def _manual_exchange_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    exchange: str,
+) -> None:
+    runtime = _runtime(context)
+    if not _allowed(update, runtime):
+        return
+    chat_id = update.effective_chat.id
+    try:
+        symbols = _parse_manual_exchange_symbols(list(context.args or []))
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc), reply_markup=_keyboard(runtime, chat_id))
+        return
+    if not symbols:
+        example = "/binance btc,eth,sol" if exchange == "binance" else "/mexc xau,xag,usoil"
+        await update.effective_message.reply_text(
+            f"Укажи тикеры через запятую. Например: {example}",
+            reply_markup=_keyboard(runtime, chat_id),
+        )
+        return
+
+    now = time.monotonic()
+    last = runtime.last_scan_started.get(chat_id)
+    if last is not None and now - last < runtime.settings.scan_cooldown_seconds:
+        await update.effective_message.reply_text(
+            f"Подожди {int(runtime.settings.scan_cooldown_seconds - (now - last)) + 1} сек перед повторным ручным запуском.",
+            reply_markup=_keyboard(runtime, chat_id),
+        )
+        return
+    runtime.last_scan_started[chat_id] = now
+    # Intentionally do not cancel, arm, reschedule, or otherwise touch the auto timer.
+    await _perform_manual_exchange_archive(
+        context.application,
+        chat_id,
+        exchange=exchange,
+        symbols=symbols,
+    )
+
+
+async def binance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _manual_exchange_command(update, context, "binance")
+
+
+async def mexc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _manual_exchange_command(update, context, "mexc")
 
 
 async def time_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1275,7 +1517,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Чем ниже score, тем больше сетапов и ниже строгость отбора; чем выше — тем меньше и строже.\n"
         "/log_full — подробный журнал только за последние 24 часа.\n"
         "/status — состояние бота и последнего анализа/Parquet.\n"
-        "/scan — Анализ; /parquet — собрать Parquet; /ping — проверка бота; /gmail — подключение почты.\n\n"
+        "/scan — Анализ; /parquet — собрать основной Parquet; /ping — проверка бота; /gmail — подключение почты.\n"
+        "/binance btc — ручной архив только BTC с Binance Spot.\n"
+        "/binance btc,eth,sol,pol — ручной архив Binance Spot по всем указанным тикерам.\n"
+        "/mexc xau — ручной архив только XAU с MEXC Futures.\n"
+        "/mexc xau,xag,usoil,btc — ручной архив MEXC Futures по всем указанным тикерам.\n"
+        "Ручные /binance и /mexc не меняют выбранный top и не переключают/перезапускают автоматический таймер. "
+        "Для каждого тикера собираются те же 999×1H + 365×1D + 288×15m; Binance добавляет Spot depth и breadth выбранного набора, MEXC — funding + OI/basis.\n\n"
         f"Parquet: top-{runtime.top_limit(chat_id)} Binance Spot, 1H/1D/15m, Spot depth, breadth, MEXC funding/derivatives, XAU/XAG/USOIL и optional Deribit BTC/ETH options. "
         "Кнопка «Топ-100/150/200/250/300» циклически меняет только размер крипто-универсума Parquet."
     )
@@ -1475,6 +1723,8 @@ def main() -> None:
     app.add_handler(CommandHandler("score_s", score_s))
     app.add_handler(CommandHandler("scan", analysis))
     app.add_handler(CommandHandler("parquet", parquet_export))
+    app.add_handler(CommandHandler("binance", binance_command))
+    app.add_handler(CommandHandler("mexc", mexc_command))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("gmail", gmail_command))
     app.add_handler(CommandHandler("log_mail", log_mail))

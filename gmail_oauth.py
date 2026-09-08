@@ -402,7 +402,7 @@ class GmailOAuthManager:
         if self._runner is not None:
             self._audit("health_server_already_started")
             return
-        # v023 uses Gmail session import only. Port 80 remains solely for
+        # v026 uses Gmail session import only. Port 80 remains solely for
         # Docker/Coolify health checks; the Google OAuth callback route is not
         # registered at all.
         app = web.Application(client_max_size=1024 * 1024)
@@ -704,7 +704,9 @@ class GmailOAuthManager:
                     self._audit("gmail_send_token_refreshed", attempt=attempt, max_attempts=max_attempts)
                     continue
 
-                if status == 408 or status == 429 or status >= 500:
+                if status == 429:
+                    # A rate-limit response is a definitive rejection, so a delayed
+                    # retry cannot duplicate an already accepted Gmail message.
                     if attempt < max_attempts:
                         delay = GMAIL_SEND_RETRY_DELAYS_SECONDS[attempt - 1]
                         self._audit(
@@ -713,15 +715,32 @@ class GmailOAuthManager:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             retry_in_sec=delay,
-                            reason="http",
+                            reason="http_429",
                             http_status=status,
                         )
                         await asyncio.sleep(delay)
                         attempt += 1
                         continue
+                    raise GmailOAuthError(
+                        f"Gmail API HTTP 429 сохранился после {max_attempts} попыток; письмо не отправлено."
+                    )
+
+                if status == 408 or status >= 500:
+                    # With an HTTP 408/5xx response the send result can be ambiguous:
+                    # Gmail may already have accepted the MIME message before the
+                    # error surfaced. Never POST it again automatically because the
+                    # Gmail send endpoint has no idempotency key.
+                    self._audit(
+                        "gmail_send_uncertain_no_retry",
+                        level=logging.ERROR,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        reason="ambiguous_http",
+                        http_status=status,
+                    )
                     raise GmailSendUncertain(
-                        f"Gmail API HTTP {status} сохранился после {max_attempts} попыток; "
-                        "на последней попытке доставка могла остаться неопределённой."
+                        f"Gmail API вернул HTTP {status}; автоматический повтор отключён, "
+                        "потому что письмо уже могло быть принято и повтор мог бы создать дубликат."
                     )
 
                 if status >= 300:

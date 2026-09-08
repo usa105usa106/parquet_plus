@@ -166,10 +166,10 @@ async def _fetch_marketcap_candidates(
     target_count: int,
 ) -> tuple[list[dict[str, Any]], str]:
     """Get enough ranked assets to fill the requested Binance-Spot-eligible universe."""
-    # Top-100 keeps the original single-page CoinGecko request. Larger universes
-    # need a deeper market-cap pool because stable/wrapped assets and coins without
-    # a TRADING Binance Spot USDT pair are excluded later.
-    candidate_target = 250 if target_count <= 100 else 500 if target_count <= 200 else 1000
+    # Keep the selection/filtering logic unchanged; only widen the ranked candidate
+    # pool so stable/wrapped assets and coins without a TRADING Binance Spot USDT
+    # pair do not prevent the requested universe from being filled.
+    candidate_target = 500 if target_count <= 150 else 1000
     try:
         market_rows: list[dict[str, Any]] = []
         pages = max(1, (candidate_target + 249) // 250)
@@ -624,13 +624,24 @@ def _mexc_contract_map(tickers: list[dict[str, Any]], wanted: set[str]) -> dict[
     return result
 
 
+def _manual_mexc_contract_map(tickers: list[dict[str, Any]], wanted: set[str]) -> dict[str, str]:
+    """Resolve explicit manual tickers, including user-facing commodity aliases."""
+    result = _mexc_contract_map(tickers, wanted)
+    available = {str(row.get("symbol") or "").upper() for row in tickers if isinstance(row, dict)}
+    for asset, contract in COMMODITY_CONTRACTS.items():
+        if asset in wanted and contract in available:
+            result[asset] = contract
+    return result
+
+
 
 def _build_mexc_derivatives(
     universe: list[dict[str, Any]],
     all_tickers: list[dict[str, Any]],
+    contract_map_override: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     wanted = {str(row["symbol"]).upper() for row in universe}
-    contract_map = _mexc_contract_map(all_tickers, wanted)
+    contract_map = dict(contract_map_override) if contract_map_override is not None else _mexc_contract_map(all_tickers, wanted)
     ticker_by_contract = {str(row.get("symbol") or "").upper(): row for row in all_tickers}
     rows: list[dict[str, Any]] = []
     statuses: dict[str, dict[str, Any]] = {}
@@ -691,9 +702,10 @@ async def _fetch_mexc_funding(
     universe: list[dict[str, Any]],
     all_tickers: list[dict[str, Any]],
     limiter: RequestRateLimiter,
+    contract_map_override: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     wanted = {str(row["symbol"]).upper() for row in universe}
-    contract_map = _mexc_contract_map(all_tickers, wanted)
+    contract_map = dict(contract_map_override) if contract_map_override is not None else _mexc_contract_map(all_tickers, wanted)
     ticker_by_contract = {str(row.get("symbol") or "").upper(): row for row in all_tickers}
     sem = asyncio.Semaphore(8)
     rows_out: list[dict[str, Any]] = []
@@ -842,7 +854,7 @@ async def _fetch_mexc_funding(
     return rows_out, statuses
 
 
-async def _fetch_mexc_commodities_interval(
+async def _fetch_mexc_ohlcv_interval(
     client: httpx.AsyncClient,
     settings: Settings,
     *,
@@ -851,7 +863,9 @@ async def _fetch_mexc_commodities_interval(
     cutoff_ms: int,
     all_tickers: list[dict[str, Any]],
     limiter: RequestRateLimiter,
+    contracts: dict[str, str],
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Fetch closed MEXC Futures candles for an explicit asset->contract map."""
     ticker_by_contract = {str(row.get("symbol") or "").upper(): row for row in all_tickers}
     rows_out: list[dict[str, Any]] = []
     statuses: dict[str, dict[str, Any]] = {}
@@ -924,12 +938,29 @@ async def _fetch_mexc_commodities_interval(
                 "requested": limit,
             }
 
-    results = await asyncio.gather(*(one(asset, contract) for asset, contract in COMMODITY_CONTRACTS.items()))
+    results = await asyncio.gather(*(one(asset, contract) for asset, contract in contracts.items()))
     for asset, rows, status in results:
         rows_out.extend(rows)
         statuses[asset] = status
     rows_out.sort(key=lambda r: (r["asset"], r["timestamp_ms"]))
     return rows_out, statuses
+
+
+async def _fetch_mexc_commodities_interval(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    interval: str,
+    limit: int,
+    cutoff_ms: int,
+    all_tickers: list[dict[str, Any]],
+    limiter: RequestRateLimiter,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    # Compatibility wrapper for the unchanged main market-scan commodity block.
+    return await _fetch_mexc_ohlcv_interval(
+        client, settings, interval=interval, limit=limit, cutoff_ms=cutoff_ms,
+        all_tickers=all_tickers, limiter=limiter, contracts=COMMODITY_CONTRACTS,
+    )
 
 
 def _option_atm_iv(rows: list[dict[str, Any]], target_days: int) -> tuple[float | None, int | None]:
@@ -1205,6 +1236,414 @@ class ArchiveBuildResult:
     mexc_funding_coverage: int
     commodities_ok_count: int
     duration_seconds: float
+
+
+def _manual_prompt_text(app_version: str, exchange: str, symbols: list[str]) -> str:
+    source = "Binance Spot" if exchange == "binance" else "MEXC Futures"
+    symbol_text = ", ".join(symbols)
+    extras = (
+        "Используй также binance_spot_liquidity.parquet и market_breadth.parquet."
+        if exchange == "binance"
+        else "Используй также funding_mexc.parquet и mexc_derivatives.parquet."
+    )
+    return (
+        f"PROMPT ДЛЯ РУЧНОГО PARQUET · {app_version}\n\n"
+        f"В архиве находятся данные только по выбранным инструментам: {symbol_text}.\n"
+        f"Источник рынка: {source}.\n"
+        "Свечи: до 999 закрытых 1H, до 365 закрытых 1D и до 288 закрытых 15m.\n"
+        f"{extras}\n"
+        "Не подмешивай другие монеты, другие биржи или внешние рыночные данные. "
+        "Анализируй только содержимое этого архива.\n"
+    )
+
+
+def _manual_binance_universe(
+    exchange_info: dict[str, Any],
+    tickers_raw: Any,
+    requested_symbols: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    pairs = _spot_pairs(exchange_info)
+    tickers = {
+        str(row.get("symbol") or "").upper(): row
+        for row in (tickers_raw if isinstance(tickers_raw, list) else [])
+        if isinstance(row, dict)
+    }
+    resolved: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for requested in requested_symbols:
+        canonical = BASE_ALIASES.get(requested, requested)
+        if canonical in seen:
+            continue
+        if canonical not in pairs:
+            missing.append(requested)
+            continue
+        seen.add(canonical)
+        resolved.append(canonical)
+    if missing:
+        return [], missing
+
+    universe: list[dict[str, Any]] = []
+    for idx, symbol in enumerate(resolved, start=1):
+        pair = pairs[symbol]
+        ticker = tickers.get(pair) or {}
+        universe.append({
+            "analysis_rank": idx,
+            "symbol": symbol,
+            "name": symbol,
+            "selection_mode": "manual",
+            "binance_base_asset": symbol,
+            "binance_symbol": pair,
+            "binance_last_price": _num(ticker.get("lastPrice")),
+            "binance_quote_volume_24h": _num(ticker.get("quoteVolume")),
+            "binance_base_volume_24h": _num(ticker.get("volume")),
+            "binance_trade_count_24h": _int(ticker.get("count")),
+            "change_24h_pct": _num(ticker.get("priceChangePercent")),
+            "change_7d_pct": None,
+            "binance_high_24h": _num(ticker.get("highPrice")),
+            "binance_low_24h": _num(ticker.get("lowPrice")),
+        })
+    return universe, []
+
+
+def _populate_manual_binance_7d_change(
+    universe: list[dict[str, Any]],
+    daily_rows: list[dict[str, Any]],
+) -> None:
+    """Populate manual Binance 7d change from already downloaded closed 1D candles."""
+    closes_by_asset: dict[str, list[tuple[int, float]]] = {}
+    for row in daily_rows:
+        close = _num(row.get("close"))
+        if close is None:
+            continue
+        symbol = str(row.get("asset") or "")
+        if not symbol:
+            continue
+        closes_by_asset.setdefault(symbol, []).append((int(row.get("timestamp_ms") or 0), float(close)))
+
+    for row in universe:
+        symbol = str(row.get("symbol") or "")
+        points = sorted(closes_by_asset.get(symbol) or [], key=lambda item: item[0])
+        # Seven daily intervals require the latest closed candle plus the close
+        # seven candles earlier (8 closes total).
+        if len(points) >= 8 and points[-8][1] != 0:
+            row["change_7d_pct"] = (points[-1][1] / points[-8][1] - 1.0) * 100.0
+        else:
+            row["change_7d_pct"] = None
+
+
+async def build_manual_exchange_archive(
+    settings: Settings,
+    *,
+    exchange: str,
+    symbols: list[str],
+    progress: Callable[[str], Any] | None = None,
+) -> ArchiveBuildResult:
+    """Build an isolated manual archive for explicitly requested exchange symbols.
+
+    This path never changes the ranked top universe and does not call the other
+    exchange for enrichment: /binance is Binance Spot only; /mexc is MEXC Futures only.
+    """
+    exchange = str(exchange).strip().lower()
+    if exchange not in {"binance", "mexc"}:
+        raise ValueError("exchange must be binance or mexc")
+
+    requested: list[str] = []
+    seen_requested: set[str] = set()
+    for raw in symbols:
+        symbol = str(raw).strip().upper()
+        if not symbol or symbol in seen_requested:
+            continue
+        seen_requested.add(symbol)
+        requested.append(symbol)
+    if not requested:
+        raise ValueError("Не указаны тикеры")
+
+    started = time.monotonic()
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    msk = now.astimezone(ZoneInfo(settings.user_timezone))
+    hour_start_ms = _closed_interval_start_ms(60 * 60 * 1000, now_ms)
+    m15_start_ms = _closed_interval_start_ms(15 * 60 * 1000, now_ms)
+    day_start_ms = _closed_interval_start_ms(24 * 60 * 60 * 1000, now_ms)
+    stamp = msk.strftime("%Y%m%d_%H%M%S")
+    run_dir = settings.work_dir / f"manual_scan_{exchange}_{stamp}_{time.time_ns()}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    async def say(text: str) -> None:
+        if progress is not None:
+            value = progress(text)
+            if asyncio.iscoroutine(value):
+                await value
+
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": f"CoolifyMarketScanBot/{settings.app_version}",
+    }
+    timeout = httpx.Timeout(settings.market_http_timeout, connect=min(10.0, settings.market_http_timeout))
+
+    try:
+        generated_utc = now.isoformat()
+        generated_msk = msk.isoformat()
+        if exchange == "binance":
+            await say(f"Проверяю Binance Spot: {', '.join(requested)}…")
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                exchange_info, tickers_raw = await asyncio.gather(
+                    _get_json(client, f"{settings.binance_spot_base_url}/api/v3/exchangeInfo"),
+                    _get_json(client, f"{settings.binance_spot_base_url}/api/v3/ticker/24hr"),
+                )
+                universe, missing = _manual_binance_universe(exchange_info, tickers_raw, requested)
+                if missing:
+                    raise ValueError(
+                        "Нет активной Binance Spot USDT-пары: " + ", ".join(missing)
+                    )
+
+                await say("Скачиваю Binance Spot: 999×1H, 365×1D, 288×15m и стакан…")
+                sem = asyncio.Semaphore(16)
+                one_h_task = asyncio.create_task(_fetch_binance_ohlcv_interval(
+                    client, settings, universe, interval="1h", limit=settings.candle_limit,
+                    cutoff_ms=hour_start_ms, sem=sem,
+                ))
+                one_d_task = asyncio.create_task(_fetch_binance_ohlcv_interval(
+                    client, settings, universe, interval="1d", limit=settings.daily_candle_limit,
+                    cutoff_ms=day_start_ms, sem=sem,
+                ))
+                m15_task = asyncio.create_task(_fetch_binance_ohlcv_interval(
+                    client, settings, universe, interval="15m", limit=settings.m15_candle_limit,
+                    cutoff_ms=m15_start_ms, sem=sem,
+                ))
+                depth_task = asyncio.create_task(_fetch_binance_spot_liquidity(client, settings, universe, sem))
+                (rows_1h, status_1h), (rows_1d, status_1d), (rows_15m, status_15m), (depth_rows, depth_status) = await asyncio.gather(
+                    one_h_task, one_d_task, m15_task, depth_task
+                )
+            _populate_manual_binance_7d_change(universe, rows_1d)
+            breadth_rows = _build_market_breadth(universe, rows_1d, now_ms)
+            for row in universe:
+                symbol = str(row["symbol"])
+                s1h = status_1h.get(symbol) or {}
+                s1d = status_1d.get(symbol) or {}
+                s15 = status_15m.get(symbol) or {}
+                depth = depth_status.get(symbol) or {}
+                row["candle_count_1h"] = int(s1h.get("candles") or 0)
+                row["candle_status_1h"] = s1h.get("status")
+                row["candle_count_1d"] = int(s1d.get("candles") or 0)
+                row["candle_status_1d"] = s1d.get("status")
+                row["candle_count_15m"] = int(s15.get("candles") or 0)
+                row["candle_status_15m"] = s15.get("status")
+                row["binance_depth_status"] = depth.get("status")
+
+            await say("Пишу ручной Binance Parquet и собираю ZIP…")
+            _write_parquet(run_dir / "crypto_ohlcv_1h.parquet", rows_1h)
+            _write_parquet(run_dir / "crypto_ohlcv_1d.parquet", rows_1d)
+            _write_parquet(run_dir / "crypto_ohlcv_15m.parquet", rows_15m)
+            _write_parquet(run_dir / "binance_spot_liquidity.parquet", depth_rows)
+            _write_parquet(run_dir / "market_breadth.parquet", breadth_rows)
+            _write_parquet(run_dir / "universe.parquet", universe)
+            resolved_symbols = [str(row["symbol"]) for row in universe]
+            prompt_name = "PROMPT_FOR_CHATGPT.txt"
+            (run_dir / prompt_name).write_text(
+                _manual_prompt_text(settings.app_version, exchange, resolved_symbols), encoding="utf-8"
+            )
+            files = [
+                "crypto_ohlcv_1h.parquet", "crypto_ohlcv_1d.parquet", "crypto_ohlcv_15m.parquet",
+                "binance_spot_liquidity.parquet", "market_breadth.parquet", "universe.parquet",
+                prompt_name, "manifest.json", "status.json",
+            ]
+            manifest = {
+                "app_version": settings.app_version,
+                "archive_type": "manual_exchange_parquet",
+                "exchange": "Binance Spot",
+                "selection": "explicit Telegram command",
+                "requested_symbols": requested,
+                "resolved_symbols": resolved_symbols,
+                "generated_at_utc": generated_utc,
+                "generated_at_msk": generated_msk,
+                "timezone": settings.user_timezone,
+                "no_cache": True,
+                "candle_policy": {
+                    "1h": {"requested_closed_candles": settings.candle_limit, "current_open_candle_excluded": True},
+                    "1d": {"requested_closed_candles": settings.daily_candle_limit, "current_open_candle_excluded": True},
+                    "15m": {"requested_closed_candles": settings.m15_candle_limit, "current_open_candle_excluded": True},
+                },
+                "spot_depth_source": "Binance Spot",
+                "files": files,
+            }
+            status = {
+                "app_version": settings.app_version,
+                "exchange": "Binance Spot",
+                "generated_at_utc": generated_utc,
+                "crypto_1h": status_1h,
+                "crypto_1d": status_1d,
+                "crypto_15m": status_15m,
+                "binance_spot_liquidity": depth_status,
+            }
+            full_count = sum(1 for v in status_1h.values() if v.get("status") == "OK")
+            partial_count = sum(1 for v in status_1h.values() if v.get("status") == "PARTIAL_HISTORY")
+            funding_coverage = 0
+            commodity_full = 0
+
+        else:
+            await say(f"Проверяю MEXC Futures: {', '.join(requested)}…")
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                mexc_raw = await _get_json(
+                    client, f"{settings.mexc_contract_base_url}/api/v1/contract/ticker", attempts=2
+                )
+                mexc_tickers = _mexc_ticker_list(mexc_raw)
+                contract_map = _manual_mexc_contract_map(mexc_tickers, set(requested))
+                missing = [symbol for symbol in requested if symbol not in contract_map]
+                if missing:
+                    raise ValueError(
+                        "Нет активного MEXC Futures USDT-контракта: " + ", ".join(missing)
+                    )
+                contracts = {symbol: contract_map[symbol] for symbol in requested}
+                universe = [
+                    {
+                        "analysis_rank": idx,
+                        "symbol": symbol,
+                        "name": symbol,
+                        "selection_mode": "manual",
+                        "mexc_contract": contracts[symbol],
+                    }
+                    for idx, symbol in enumerate(requested, start=1)
+                ]
+                derivative_rows, derivative_status = _build_mexc_derivatives(
+                    universe, mexc_tickers, contract_map_override=contracts
+                )
+                limiter = RequestRateLimiter(max_calls=8, period=1.0)
+
+                await say("Скачиваю MEXC Futures: 999×1H, 365×1D, 288×15m + funding/OI/basis…")
+                one_h_task = asyncio.create_task(_fetch_mexc_ohlcv_interval(
+                    client, settings, interval="Min60", limit=settings.candle_limit,
+                    cutoff_ms=hour_start_ms, all_tickers=mexc_tickers, limiter=limiter, contracts=contracts,
+                ))
+                one_d_task = asyncio.create_task(_fetch_mexc_ohlcv_interval(
+                    client, settings, interval="Day1", limit=settings.daily_candle_limit,
+                    cutoff_ms=day_start_ms, all_tickers=mexc_tickers, limiter=limiter, contracts=contracts,
+                ))
+                m15_task = asyncio.create_task(_fetch_mexc_ohlcv_interval(
+                    client, settings, interval="Min15", limit=settings.m15_candle_limit,
+                    cutoff_ms=m15_start_ms, all_tickers=mexc_tickers, limiter=limiter, contracts=contracts,
+                ))
+                funding_task = asyncio.create_task(
+                    _fetch_mexc_funding(
+                        client, settings, universe, mexc_tickers, limiter, contract_map_override=contracts
+                    )
+                )
+                (rows_1h, status_1h), (rows_1d, status_1d), (rows_15m, status_15m), (funding_rows, funding_status) = await asyncio.gather(
+                    one_h_task, one_d_task, m15_task, funding_task
+                )
+
+            for row in universe:
+                symbol = str(row["symbol"])
+                s1h = status_1h.get(symbol) or {}
+                s1d = status_1d.get(symbol) or {}
+                s15 = status_15m.get(symbol) or {}
+                fstat = funding_status.get(symbol) or {}
+                dstat = derivative_status.get(symbol) or {}
+                row["candle_count_1h"] = int(s1h.get("candles") or 0)
+                row["candle_status_1h"] = s1h.get("status")
+                row["candle_count_1d"] = int(s1d.get("candles") or 0)
+                row["candle_status_1d"] = s1d.get("status")
+                row["candle_count_15m"] = int(s15.get("candles") or 0)
+                row["candle_status_15m"] = s15.get("status")
+                row["mexc_funding_status"] = fstat.get("status")
+                row["mexc_funding_history_records"] = int(fstat.get("history_records") or 0)
+                row["mexc_derivatives_status"] = dstat.get("status")
+                row["mexc_open_interest_hold_vol"] = dstat.get("open_interest_hold_vol")
+                row["mexc_basis_last_vs_index_pct"] = dstat.get("basis_last_vs_index_pct")
+
+            await say("Пишу ручной MEXC Parquet и собираю ZIP…")
+            _write_parquet(run_dir / "mexc_ohlcv_1h.parquet", rows_1h)
+            _write_parquet(run_dir / "mexc_ohlcv_1d.parquet", rows_1d)
+            _write_parquet(run_dir / "mexc_ohlcv_15m.parquet", rows_15m)
+            _write_parquet(run_dir / "funding_mexc.parquet", funding_rows)
+            _write_parquet(run_dir / "mexc_derivatives.parquet", derivative_rows)
+            _write_parquet(run_dir / "universe.parquet", universe)
+            resolved_symbols = list(requested)
+            prompt_name = "PROMPT_FOR_CHATGPT.txt"
+            (run_dir / prompt_name).write_text(
+                _manual_prompt_text(settings.app_version, exchange, resolved_symbols), encoding="utf-8"
+            )
+            files = [
+                "mexc_ohlcv_1h.parquet", "mexc_ohlcv_1d.parquet", "mexc_ohlcv_15m.parquet",
+                "funding_mexc.parquet", "mexc_derivatives.parquet", "universe.parquet",
+                prompt_name, "manifest.json", "status.json",
+            ]
+            manifest = {
+                "app_version": settings.app_version,
+                "archive_type": "manual_exchange_parquet",
+                "exchange": "MEXC Futures",
+                "selection": "explicit Telegram command",
+                "requested_symbols": requested,
+                "resolved_contracts": contracts,
+                "generated_at_utc": generated_utc,
+                "generated_at_msk": generated_msk,
+                "timezone": settings.user_timezone,
+                "no_cache": True,
+                "candle_policy": {
+                    "1h": {"requested_closed_candles": settings.candle_limit, "current_open_candle_excluded": True},
+                    "1d": {"requested_closed_candles": settings.daily_candle_limit, "current_open_candle_excluded": True},
+                    "15m": {"requested_closed_candles": settings.m15_candle_limit, "current_open_candle_excluded": True},
+                },
+                "funding_source": "MEXC Futures only",
+                "derivatives_fields": ["holdVol/open interest", "last/index/fair basis", "funding", "24h volume", "bid1/ask1"],
+                "files": files,
+            }
+            status = {
+                "app_version": settings.app_version,
+                "exchange": "MEXC Futures",
+                "generated_at_utc": generated_utc,
+                "mexc_1h": status_1h,
+                "mexc_1d": status_1d,
+                "mexc_15m": status_15m,
+                "funding_mexc": funding_status,
+                "mexc_derivatives": derivative_status,
+            }
+            full_count = 0
+            partial_count = 0
+            funding_coverage = sum(1 for v in funding_status.values() if v.get("contract"))
+            commodity_full = sum(
+                1 for symbol, v in status_1h.items()
+                if symbol in COMMODITY_CONTRACTS and v.get("status") == "OK"
+            )
+
+        _write_json(run_dir / "manifest.json", manifest)
+        _write_json(run_dir / "status.json", status)
+
+        archive_path = settings.exports_dir / f"manual_scan_{exchange}_{stamp}.zip"
+        if archive_path.exists():
+            archive_path = settings.exports_dir / f"manual_scan_{exchange}_{stamp}_{time.time_ns() % 1_000_000:06d}.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for name in manifest["files"]:
+                zf.write(run_dir / name, arcname=name)
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            broken = zf.testzip()
+            if broken:
+                raise RuntimeError(f"ZIP integrity failed at {broken}")
+
+        digest = _sha256(archive_path)
+        duration = time.monotonic() - started
+        log.info(
+            "manual_scan archive complete version=%s exchange=%s symbols=%s file=%s bytes=%s sha256=%s duration_sec=%.3f",
+            settings.app_version, exchange, ",".join(requested), archive_path.name,
+            archive_path.stat().st_size, digest, duration,
+        )
+        await say("Ручной архив готов.")
+        return ArchiveBuildResult(
+            archive_path=archive_path,
+            archive_size_bytes=archive_path.stat().st_size,
+            archive_sha256=digest,
+            generated_at_utc=generated_utc,
+            generated_at_msk=generated_msk,
+            universe_count=len(resolved_symbols),
+            binance_full_count=full_count,
+            binance_partial_count=partial_count,
+            mexc_funding_coverage=funding_coverage,
+            commodities_ok_count=commodity_full,
+            duration_seconds=duration,
+        )
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 async def build_market_archive(settings: Settings, *, progress: Callable[[str], Any] | None = None, top_limit: int = 100) -> ArchiveBuildResult:
