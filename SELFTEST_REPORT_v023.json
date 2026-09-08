@@ -1,0 +1,29 @@
+{
+  "version": "v023",
+  "live_external_apis_tested": false,
+  "checks": {
+    "compileall_and_ast": "PASS",
+    "builder_entry_accepts_100_150_200_250_300": "PASS",
+    "top_selection_all_five": "PASS",
+    "stable_wrapped_exclusions": "PASS",
+    "candidate_depth_250_500_1000": "PASS",
+    "mexc_commodities_unchanged": "PASS",
+    "telegram_ambiguous_no_zip_retry": "PASS",
+    "telegram_uncertain_still_starts_gmail_once": "PASS",
+    "dual_confirmed_cleanup_scan_zips": "PASS",
+    "active_concurrent_archive_protected": "PASS",
+    "gmail_http_transient_retry": "PASS",
+    "gmail_connect_retry": "PASS",
+    "gmail_ambiguous_network_no_retry": "PASS",
+    "gmail_permanent_400_no_retry": "PASS",
+    "gmail_persistent_ledger_blocks_second_send": "PASS",
+    "gmail_deterministic_message_id": "PASS",
+    "analysis_logic_version_only": "PASS",
+    "collector_change_only_top_validation": "PASS",
+    "version_v023_everywhere": "PASS"
+  },
+  "limitations": [
+    "Live external API and Telegram/Gmail delivery were not executed.",
+    "pyarrow and python-telegram-bot are absent in the local test environment; minimal import stubs were used for mocked/synthetic tests."
+  ]
+}

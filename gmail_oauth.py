@@ -29,6 +29,7 @@ GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 OAUTH_SCOPES = ["openid", "email", GMAIL_SEND_SCOPE]
+GMAIL_SEND_RETRY_DELAYS_SECONDS: tuple[float, ...] = (2.0, 5.0, 12.0)
 
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.apps\.googleusercontent\.com$")
 
@@ -46,7 +47,15 @@ class GmailArchiveChanged(GmailOAuthError):
 
 
 class GmailSendUncertain(GmailOAuthError):
-    """The request may have reached Gmail, so automatic retry is blocked."""
+    """Gmail may have accepted the message, so an automatic resend is unsafe."""
+
+
+def _is_definite_gmail_connect_failure(exc: BaseException) -> bool:
+    """Return True only for failures known to occur before an HTTP request is sent."""
+    connect_timeout_cls = getattr(aiohttp, "ConnectionTimeoutError", None)
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return True
+    return bool(connect_timeout_cls is not None and isinstance(exc, connect_timeout_cls))
 
 
 @dataclass(frozen=True)
@@ -393,7 +402,7 @@ class GmailOAuthManager:
         if self._runner is not None:
             self._audit("health_server_already_started")
             return
-        # v020 uses Gmail session import only. Port 80 remains solely for
+        # v023 uses Gmail session import only. Port 80 remains solely for
         # Docker/Coolify health checks; the Google OAuth callback route is not
         # registered at all.
         app = web.Application(client_max_size=1024 * 1024)
@@ -626,48 +635,107 @@ class GmailOAuthManager:
         token: dict[str, Any],
         timeout: aiohttp.ClientTimeout,
     ) -> dict[str, Any]:
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    GMAIL_SEND_URL,
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    json={"raw": raw},
-                ) as response:
-                    payload = await self._response_json(response)
-                    if response.status == 401:
-                        # 401 is a definitive rejection; refreshing and retrying once is safe.
-                        token["access_token"] = ""
-                        token["expires_at"] = 0
-                        self.secret_store.save_gmail_oauth(token)
-                        access_token = await self._valid_access_token(token)
-                        async with session.post(
-                            GMAIL_SEND_URL,
-                            headers={"Authorization": f"Bearer {access_token}"},
-                            json={"raw": raw},
-                        ) as retry_response:
-                            payload = await self._response_json(retry_response)
-                            if retry_response.status == 408 or retry_response.status >= 500:
-                                raise GmailSendUncertain(
-                                    f"Gmail API HTTP {retry_response.status}; письмо могло быть принято. Автоповтор заблокирован."
-                                )
-                            if retry_response.status >= 300:
-                                raise GmailOAuthError(
-                                    f"Gmail API send failed HTTP {retry_response.status}: {payload}"
-                                )
-                    elif response.status == 408 or response.status >= 500:
+        # Reuse the exact same raw MIME bytes on every safe retry. Archive messages
+        # carry a deterministic Message-ID derived from the ZIP SHA-256 and the
+        # persistent ledger blocks a second independent send of the same archive.
+        # Ambiguous read/write/network failures are never retried because Gmail may
+        # already have accepted the message and the send API is not idempotent.
+        max_attempts = 1 + len(GMAIL_SEND_RETRY_DELAYS_SECONDS)
+        attempt = 1
+        auth_refreshed = False
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                try:
+                    async with session.post(
+                        GMAIL_SEND_URL,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        json={"raw": raw},
+                    ) as response:
+                        payload = await self._response_json(response)
+                        status = int(response.status)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    if _is_definite_gmail_connect_failure(exc):
+                        # DNS/refused/connect-timeout happened before the request
+                        # could be delivered to Gmail, so retrying cannot duplicate
+                        # an already accepted message.
+                        if attempt < max_attempts:
+                            delay = GMAIL_SEND_RETRY_DELAYS_SECONDS[attempt - 1]
+                            self._audit(
+                                "gmail_send_retry",
+                                level=logging.WARNING,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                retry_in_sec=delay,
+                                reason="connect",
+                                error_type=type(exc).__name__,
+                            )
+                            await asyncio.sleep(delay)
+                            attempt += 1
+                            continue
                         raise GmailSendUncertain(
-                            f"Gmail API HTTP {response.status}; письмо могло быть принято. Автоповтор заблокирован."
+                            f"Не удалось установить соединение с Gmail после {max_attempts} попыток; письмо не подтверждено."
+                        ) from exc
+
+                    # Read timeout/server disconnect/write ambiguity can happen
+                    # after Gmail has already accepted the request. Retrying here
+                    # could create duplicate archive emails, so stop immediately.
+                    self._audit(
+                        "gmail_send_uncertain_no_retry",
+                        level=logging.ERROR,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        reason="ambiguous_network",
+                        error_type=type(exc).__name__,
+                    )
+                    raise GmailSendUncertain(
+                        "Ответ Gmail потерян после начала HTTP-запроса; автоматический повтор отключён, "
+                        "чтобы не создать дубликат письма."
+                    ) from exc
+
+                if status == 401 and not auth_refreshed:
+                    # 401 is a definitive rejection. Refresh once and resend the
+                    # same MIME body without consuming a transient-retry slot.
+                    token["access_token"] = ""
+                    token["expires_at"] = 0
+                    self.secret_store.save_gmail_oauth(token)
+                    access_token = await self._valid_access_token(token)
+                    auth_refreshed = True
+                    self._audit("gmail_send_token_refreshed", attempt=attempt, max_attempts=max_attempts)
+                    continue
+
+                if status == 408 or status == 429 or status >= 500:
+                    if attempt < max_attempts:
+                        delay = GMAIL_SEND_RETRY_DELAYS_SECONDS[attempt - 1]
+                        self._audit(
+                            "gmail_send_retry",
+                            level=logging.WARNING,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            retry_in_sec=delay,
+                            reason="http",
+                            http_status=status,
                         )
-                    elif response.status >= 300:
-                        raise GmailOAuthError(f"Gmail API send failed HTTP {response.status}: {payload}")
-                    return payload if isinstance(payload, dict) else {}
-        except GmailOAuthError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise GmailSendUncertain(
-                "Соединение с Gmail оборвалось во время отправки; неизвестно, принято ли письмо. "
-                "Чтобы не создать дубль, этот ZIP автоматически повторно не отправляется."
-            ) from exc
+                        await asyncio.sleep(delay)
+                        attempt += 1
+                        continue
+                    raise GmailSendUncertain(
+                        f"Gmail API HTTP {status} сохранился после {max_attempts} попыток; "
+                        "на последней попытке доставка могла остаться неопределённой."
+                    )
+
+                if status >= 300:
+                    # Permanent/auth/configuration failures are not retried.
+                    raise GmailOAuthError(f"Gmail API send failed HTTP {status}: {payload}")
+
+                if attempt > 1:
+                    self._audit(
+                        "gmail_send_recovered",
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        http_status=status,
+                    )
+                return payload if isinstance(payload, dict) else {}
 
     async def verify_connection(self) -> str:
         """Verify the currently loaded Gmail session without sending mail."""

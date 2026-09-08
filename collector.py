@@ -160,25 +160,41 @@ async def _get_json(
     raise last
 
 
-async def _fetch_marketcap_candidates(client: httpx.AsyncClient, settings: Settings) -> tuple[list[dict[str, Any]], str]:
-    """Get enough ranked assets to fill 100 Binance-Spot-eligible slots."""
+async def _fetch_marketcap_candidates(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    target_count: int,
+) -> tuple[list[dict[str, Any]], str]:
+    """Get enough ranked assets to fill the requested Binance-Spot-eligible universe."""
+    # Top-100 keeps the original single-page CoinGecko request. Larger universes
+    # need a deeper market-cap pool because stable/wrapped assets and coins without
+    # a TRADING Binance Spot USDT pair are excluded later.
+    candidate_target = 250 if target_count <= 100 else 500 if target_count <= 200 else 1000
     try:
-        rows = await _get_json(
-            client,
-            f"{settings.coingecko_base_url}/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": 250,
-                "page": 1,
-                "sparkline": "false",
-                "price_change_percentage": "24h,7d",
-            },
-            attempts=2,
-        )
-        if isinstance(rows, list) and len(rows) >= 100:
+        market_rows: list[dict[str, Any]] = []
+        pages = max(1, (candidate_target + 249) // 250)
+        for page in range(1, pages + 1):
+            rows = await _get_json(
+                client,
+                f"{settings.coingecko_base_url}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": 250,
+                    "page": page,
+                    "sparkline": "false",
+                    "price_change_percentage": "24h,7d",
+                },
+                attempts=2,
+            )
+            if not isinstance(rows, list):
+                raise RuntimeError("CoinGecko universe response is not a list")
+            market_rows.extend(row for row in rows if isinstance(row, dict))
+            if len(rows) < 250:
+                break
+        if len(market_rows) >= target_count:
             result: list[dict[str, Any]] = []
-            for row in rows:
+            for row in market_rows:
                 result.append({
                     "rank": _int(row.get("market_cap_rank")),
                     "symbol": str(row.get("symbol") or "").upper(),
@@ -242,10 +258,11 @@ def _spot_pairs(exchange_info: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def _select_top100(
+def _select_top_assets(
     candidates: list[dict[str, Any]],
     spot_pairs: dict[str, str],
     tickers: dict[str, dict[str, Any]],
+    top_limit: int,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen_pairs: set[str] = set()
@@ -273,10 +290,10 @@ def _select_top100(
         })
         selected.append(item)
         seen_pairs.add(pair)
-        if len(selected) == 100:
+        if len(selected) == top_limit:
             break
-    if len(selected) < 100:
-        raise RuntimeError(f"Could not build 100 eligible Binance Spot assets; got {len(selected)}")
+    if len(selected) < top_limit:
+        raise RuntimeError(f"Could not build {top_limit} eligible Binance Spot assets; got {len(selected)}")
     return selected
 
 
@@ -1190,8 +1207,10 @@ class ArchiveBuildResult:
     duration_seconds: float
 
 
-async def build_market_archive(settings: Settings, *, progress: Callable[[str], Any] | None = None) -> ArchiveBuildResult:
+async def build_market_archive(settings: Settings, *, progress: Callable[[str], Any] | None = None, top_limit: int = 100) -> ArchiveBuildResult:
     """Build one fresh market snapshot from zero; no candle cache is read or written."""
+    if top_limit not in {100, 150, 200, 250, 300}:
+        raise ValueError(f"Unsupported top_limit={top_limit}; expected 100, 150, 200, 250 or 300")
     started = time.monotonic()
     now = datetime.now(timezone.utc)
     now_ms = int(now.timestamp() * 1000)
@@ -1216,9 +1235,9 @@ async def build_market_archive(settings: Settings, *, progress: Callable[[str], 
     timeout = httpx.Timeout(settings.market_http_timeout, connect=min(10.0, settings.market_http_timeout))
 
     try:
-        await say("Получаю top-100, Binance Spot и MEXC Futures…")
+        await say(f"Получаю top-{top_limit}, Binance Spot и MEXC Futures…")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-            candidates_task = asyncio.create_task(_fetch_marketcap_candidates(client, settings))
+            candidates_task = asyncio.create_task(_fetch_marketcap_candidates(client, settings, top_limit))
             exchange_task = asyncio.create_task(_get_json(client, f"{settings.binance_spot_base_url}/api/v3/exchangeInfo"))
             tickers_task = asyncio.create_task(_get_json(client, f"{settings.binance_spot_base_url}/api/v3/ticker/24hr"))
             mexc_tickers_task = asyncio.create_task(_get_json(client, f"{settings.mexc_contract_base_url}/api/v1/contract/ticker", attempts=2))
@@ -1232,7 +1251,7 @@ async def build_market_archive(settings: Settings, *, progress: Callable[[str], 
                 for row in (binance_tickers_raw if isinstance(binance_tickers_raw, list) else [])
                 if isinstance(row, dict)
             }
-            universe = _select_top100(candidates, pairs, tickers)
+            universe = _select_top_assets(candidates, pairs, tickers, top_limit)
             log.info(
                 "market_scan universe selected source=%s assets=%s symbols=%s",
                 universe_source,
@@ -1414,7 +1433,8 @@ async def build_market_archive(settings: Settings, *, progress: Callable[[str], 
         prompt_source = Path(__file__).with_name("PROMPT_FOR_CHATGPT.txt")
         if not prompt_source.is_file():
             raise RuntimeError("PROMPT_FOR_CHATGPT.txt is missing from bot image")
-        shutil.copy2(prompt_source, run_dir / "PROMPT_FOR_CHATGPT.txt")
+        prompt_text = prompt_source.read_text(encoding="utf-8").replace("top-100", f"top-{top_limit}")
+        (run_dir / "PROMPT_FOR_CHATGPT.txt").write_text(prompt_text, encoding="utf-8")
 
         full_count = sum(1 for v in crypto_1h_status.values() if v.get("status") == "OK")
         partial_count = sum(1 for v in crypto_1h_status.values() if v.get("status") == "PARTIAL_HISTORY")
@@ -1466,10 +1486,10 @@ async def build_market_archive(settings: Settings, *, progress: Callable[[str], 
                 "derive_4h_from_1h_downstream": True,
             },
             "crypto": {
-                "selection": "100 highest-market-cap non-stable/non-wrapped assets with a TRADING Binance Spot USDT pair",
+                "selection": f"{top_limit} highest-market-cap non-stable/non-wrapped assets with a TRADING Binance Spot USDT pair",
                 "universe_source": universe_source,
                 "ohlcv_source": "Binance Spot",
-                "requested_assets": 100,
+                "requested_assets": top_limit,
                 "full_999_1h_assets": full_count,
                 "partial_1h_assets": partial_count,
                 "full_365_1d_assets": full_daily_count,
@@ -1481,12 +1501,12 @@ async def build_market_archive(settings: Settings, *, progress: Callable[[str], 
                 "spot_depth_limit_per_side": settings.binance_depth_limit,
                 "spot_depth_ok_assets": depth_ok_count,
             },
-            "market_breadth": {"source": "calculated locally from top-100 universe and Binance Spot daily candles"},
+            "market_breadth": {"source": f"calculated locally from top-{top_limit} universe and Binance Spot daily candles"},
             "funding": {
                 "source": "MEXC Futures only",
                 "current_rate_endpoint": "/api/v1/contract/funding_rate/{symbol}",
                 "current_rate_fallback": "contract ticker fundingRate only; metadata marked unavailable",
-                "requested_assets": 100,
+                "requested_assets": top_limit,
                 "matched_contracts": funding_coverage,
                 "history_records_requested_per_contract": settings.funding_history_count,
                 "binance_futures_used": False,

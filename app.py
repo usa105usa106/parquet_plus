@@ -63,6 +63,9 @@ TIME_MODES: list[tuple[str, int]] = [
     ("4 часа", 4 * 60 * 60),
 ]
 
+TOP_LIMITS: tuple[int, ...] = (100, 150, 200, 250, 300)
+DEFAULT_TOP_LIMIT = 100
+
 SCORE_S_MIN = 0.0
 SCORE_S_MAX = 30.0
 FULL_LOG_HOURS = 24
@@ -82,6 +85,14 @@ def _validated_commodity_score(value: Any) -> float:
 
 def _score_text(value: float) -> str:
     return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+
+def _validated_top_limit(value: Any) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TOP_LIMIT
+    return limit if limit in TOP_LIMITS else DEFAULT_TOP_LIMIT
 
 
 def _is_connect_failure(exc: BaseException) -> bool:
@@ -147,11 +158,54 @@ async def _telegram_delivery_with_retry(operation: str, call_factory: Any) -> An
             await asyncio.sleep(delay)
     return None
 
+
+async def _telegram_archive_delivery_with_status(operation: str, call_factory: Any) -> tuple[str, Any | None]:
+    """Deliver one archive without ever retrying an ambiguous Telegram result.
+
+    Only failures that are known to happen while establishing the HTTP connection
+    are retried. Read/write timeouts or connection drops after a request may mean
+    Telegram already accepted the file, so they return ``UNCERTAIN`` and Gmail may
+    continue without resending the ZIP. This protects the user from duplicate ZIPs.
+    """
+    attempts = 1 + len(TELEGRAM_RETRY_DELAYS_SECONDS)
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await call_factory()
+            if attempt > 1:
+                log.info(
+                    "telegram_archive_recovered operation=%s attempt=%s/%s",
+                    operation, attempt, attempts,
+                )
+            return "CONFIRMED", result
+        except NetworkError as exc:
+            if not _is_connect_failure(exc):
+                log.error(
+                    "telegram_archive_uncertain operation=%s attempt=%s/%s error_type=%s; "
+                    "no Telegram retry to avoid duplicate ZIP",
+                    operation, attempt, attempts, type(exc).__name__,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                return "UNCERTAIN", None
+            if attempt >= attempts:
+                log.error(
+                    "telegram_archive_failed operation=%s attempts=%s error_type=%s",
+                    operation, attempts, type(exc).__name__,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                return "FAILED", None
+            delay = TELEGRAM_RETRY_DELAYS_SECONDS[attempt - 1]
+            log.warning(
+                "telegram_archive_connect_retry operation=%s attempt=%s/%s retry_in_sec=%.1f error_type=%s",
+                operation, attempt, attempts, delay, type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
+    return "FAILED", None
+
 BTN_GMAIL_TEST = "gmail_test"
 BTN_GMAIL_DISCONNECT = "gmail_disconnect"
 BTN_GMAIL_IMPORT = "gmail_import"
 
-# Callback ids from older builds. v020 never launches OAuth/callback setup.
+# Callback ids from older builds. v023 never launches OAuth/callback setup.
 STALE_GMAIL_CALLBACKS = {
     "gmail_check",
     "gmail_config",
@@ -177,6 +231,9 @@ class Runtime:
         self.auto_tasks: dict[int, asyncio.Task[Any]] = {}
         self.auto_scanning: set[int] = set()
         self.scan_semaphore = asyncio.Semaphore(settings.max_concurrent_scans)
+        # Archives already built by concurrent scans but still awaiting delivery.
+        # Cleanup must never delete a ZIP that belongs to another active scan.
+        self.active_archive_paths: set[Path] = set()
         self.last_scan_started: dict[int, float] = {}
         self.awaiting: dict[int, dict[str, Any]] = {}
         self.full_log_path = settings.logs_dir / "full.log"
@@ -225,6 +282,7 @@ class Runtime:
                 "telegram_archives_sent": int(value.get("telegram_archives_sent", 0) or 0),
                 "gmail_archives_sent": int(value.get("gmail_archives_sent", 0) or 0),
                 "commodity_score_threshold": _validated_commodity_score(value.get("commodity_score_threshold", DEFAULT_COMMODITY_SCORE)),
+                "top_limit": _validated_top_limit(value.get("top_limit", DEFAULT_TOP_LIMIT)),
                 "scan_busy": False,
             }
         return result
@@ -269,6 +327,7 @@ class Runtime:
                 "telegram_archives_sent": 0,
                 "gmail_archives_sent": 0,
                 "commodity_score_threshold": float(DEFAULT_COMMODITY_SCORE),
+                "top_limit": DEFAULT_TOP_LIMIT,
                 "scan_busy": False,
             }
         return self.state[key]
@@ -285,6 +344,12 @@ class Runtime:
             idx = 0
             state["mode_index"] = 0
         return TIME_MODES[idx]
+
+    def top_limit(self, chat_id: int) -> int:
+        state = self.chat_state(chat_id)
+        limit = _validated_top_limit(state.get("top_limit", DEFAULT_TOP_LIMIT))
+        state["top_limit"] = limit
+        return limit
 
     def commodity_score(self, chat_id: int) -> float:
         state = self.chat_state(chat_id)
@@ -343,7 +408,7 @@ async def incoming_update_audit(update: Update, context: ContextTypes.DEFAULT_TY
             "telegram_update command update_id=%s chat_id=%s user_id=%s command=%s",
             update.update_id, chat_id, user_id, text.split(maxsplit=1)[0][:80],
         )
-    elif text.lower() in {"1", "анализ", "parquet", "отправить parquet", "почта", "подключить почту", "пинг"} or text.lower().startswith("время"):
+    elif text.lower() in {"1", "анализ", "parquet", "отправить parquet", "почта", "подключить почту", "пинг", "топ-100", "топ-150", "топ-200", "топ-250", "топ-300", "top-100", "top-150", "top-200", "top-250", "top-300"} or text.lower().startswith("время"):
         log.info(
             "telegram_update action update_id=%s chat_id=%s user_id=%s action=%s",
             update.update_id, chat_id, user_id, text[:80],
@@ -369,11 +434,12 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
 
 def _keyboard(runtime: Runtime, chat_id: int) -> ReplyKeyboardMarkup:
     label, _ = runtime.mode(chat_id)
+    top_limit = runtime.top_limit(chat_id)
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Анализ"), KeyboardButton(f"Время {label}")],
             [KeyboardButton("Parquet"), KeyboardButton("Почта")],
-            [KeyboardButton("Пинг")],
+            [KeyboardButton("Пинг"), KeyboardButton(f"Топ-{top_limit}")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -445,7 +511,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         f"Trading + Market Data Bot {BOT_VERSION}\n"
         "Анализ/1: бот сам делает свежий анализ и присылает только финальный вердикт.\n"
-        "Parquet: собирает top-100 свечи/данные без выбора LONG/SHORT, отправляет ZIP в Telegram, затем в Gmail.\n"
+        f"Parquet: собирает top-{runtime.top_limit(chat_id)} свечи/данные без выбора LONG/SHORT, отправляет ZIP в Telegram, затем в Gmail.\n"
+        "Топ-100/150/200/250/300: переключает размер крипто-универсума Parquet; по умолчанию топ-100.\n"
         "Время: выкл → 15 мин → 30 мин → 1 час → 4 часа; повторяет то действие, которым запущен цикл.\n"
         "Почта: импорт сохранённой Gmail-авторизации одной Base64-строкой; без callback/OAuth.\n"
         "Пинг: версия/отклик/uptime/RAM. /status — состояние. /log_full — журнал за последние 24 часа.\n"
@@ -499,14 +566,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Win rate: {win_rate} | Средний: {avg_r} | PF: {pf}",
         "",
         "Последний parquet:",
+        f"Выбран сейчас: топ-{runtime.top_limit(chat_id)}",
         f"Время: {_msk_text(runtime, state.get('last_parquet_at'))}",
         f"Сбор: {_elapsed(state.get('last_parquet_duration_seconds'))}",
         f"Файл: {state.get('last_archive_name') or '—'}",
         f"Размер: {_human_bytes(state.get('last_archive_size_bytes'))}",
-        f"Binance Spot: {state.get('last_binance_full_count') if state.get('last_binance_full_count') is not None else '—'}/100 полных × 999 1H",
+        f"Binance Spot: {state.get('last_binance_full_count') if state.get('last_binance_full_count') is not None else '—'}/{state.get('last_universe_count') if state.get('last_universe_count') is not None else '—'} полных × 999 1H",
         f"Частичная история: {state.get('last_binance_partial_count') if state.get('last_binance_partial_count') is not None else '—'}",
         "Доп. данные: 365×1D · 288×15m · Spot depth · breadth · MEXC OI/basis · BTC/ETH options",
-        f"MEXC funding: {state.get('last_mexc_funding_coverage') if state.get('last_mexc_funding_coverage') is not None else '—'}/100 контрактов",
+        f"MEXC funding: {state.get('last_mexc_funding_coverage') if state.get('last_mexc_funding_coverage') is not None else '—'}/{state.get('last_universe_count') if state.get('last_universe_count') is not None else '—'} контрактов",
         f"XAU/XAG/USOIL: {state.get('last_commodities_ok_count') if state.get('last_commodities_ok_count') is not None else '—'}/3 полных × 999 1H",
         f"Gmail: {runtime.gmail.status_text()} · последний архив: {state.get('last_gmail_status') or '—'}",
         f"Архивов в Telegram: {state.get('telegram_archives_sent', 0)} | Gmail: {state.get('gmail_archives_sent', 0)}",
@@ -566,6 +634,30 @@ async def _progress_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
         pass
 
 
+def _cleanup_market_scan_archives(
+    exports_dir: Path,
+    protected_paths: set[Path] | None = None,
+) -> tuple[int, int]:
+    """Delete completed Market Scan ZIPs while preserving other active scans.
+
+    Cleanup is intentionally called only after both Telegram and Gmail delivery
+    are confirmed. Other export files (logs/reports) are never touched.
+    """
+    protected = {Path(item).resolve() for item in (protected_paths or set())}
+    removed = 0
+    failed = 0
+    for archive in sorted(Path(exports_dir).glob("market_scan_*.zip")):
+        if not archive.is_file() or archive.resolve() in protected:
+            continue
+        try:
+            archive.unlink()
+            removed += 1
+        except OSError as exc:
+            failed += 1
+            log.warning("archive_cleanup_failed file=%s error=%s", archive, exc)
+    return removed, failed
+
+
 async def _send_archive_then_gmail(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -607,33 +699,45 @@ async def _send_archive_then_gmail(
                 filename=telegram_name,
                 caption=(
                     f"Market Scan {BOT_VERSION} · 999×1H + 365×1D + 288×15m\n"
-                    f"Binance Spot: {result.binance_full_count}/100 полных 1H · "
-                    f"MEXC funding: {result.mexc_funding_coverage}/100 · commodities: {result.commodities_ok_count}/3\n"
+                    f"Binance Spot: {result.binance_full_count}/{result.universe_count} полных 1H · "
+                    f"MEXC funding: {result.mexc_funding_coverage}/{result.universe_count} · commodities: {result.commodities_ok_count}/3\n"
                     "ZIP: breadth + Spot depth + MEXC OI/basis/funding + BTC/ETH options + prompt."
                 ),
                 connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
             )
 
-    sent = await _telegram_delivery_with_retry("parquet archive", _send_archive_once)
-    if sent is None:
+    telegram_status, sent = await _telegram_archive_delivery_with_status("parquet archive", _send_archive_once)
+    state = runtime.chat_state(chat_id)
+    state["last_telegram_archive_status"] = telegram_status
+    runtime.save_state()
+
+    if telegram_status == "FAILED":
         log.error("archive_delivery skipped chat_id=%s filename=%s reason=telegram_connect_failed", chat_id, telegram_name)
         return "TELEGRAM_FAILED"
 
-    delivered_name = getattr(getattr(sent, "document", None), "file_name", None) or telegram_name
-    if delivered_name != telegram_name:
-        raise RuntimeError(f"Telegram изменил имя файла: {delivered_name} != {telegram_name}")
-    log.info("archive_delivery telegram_sent chat_id=%s filename=%s", chat_id, delivered_name)
-
-    state = runtime.chat_state(chat_id)
-    state["telegram_archives_sent"] = int(state.get("telegram_archives_sent", 0)) + 1
-    runtime.save_state()
+    delivered_name = telegram_name
+    if telegram_status == "CONFIRMED":
+        delivered_name = getattr(getattr(sent, "document", None), "file_name", None) or telegram_name
+        if delivered_name != telegram_name:
+            raise RuntimeError(f"Telegram изменил имя файла: {delivered_name} != {telegram_name}")
+        log.info("archive_delivery telegram_sent chat_id=%s filename=%s", chat_id, delivered_name)
+        state["telegram_archives_sent"] = int(state.get("telegram_archives_sent", 0)) + 1
+        runtime.save_state()
+    else:
+        # The request may already have reached Telegram. Never resend the ZIP:
+        # continue to Gmail with the original validated filename/identity.
+        log.warning(
+            "archive_delivery telegram_uncertain chat_id=%s filename=%s; continuing_to_gmail=true",
+            chat_id, telegram_name,
+        )
 
     if not runtime.settings.gmail_auto_send_archives:
         log.info("archive_delivery gmail_skipped chat_id=%s reason=auto_send_off", chat_id)
-        return "AUTO_SEND_OFF"
+        return "AUTO_SEND_OFF" if telegram_status == "CONFIRMED" else "AUTO_SEND_OFF_TELEGRAM_UNCERTAIN"
     if not runtime.gmail.connected:
         log.info("archive_delivery gmail_skipped chat_id=%s reason=not_connected", chat_id)
-        return "NOT_CONNECTED"
+        return "NOT_CONNECTED" if telegram_status == "CONFIRMED" else "NOT_CONNECTED_TELEGRAM_UNCERTAIN"
+
     log.info("archive_delivery gmail_started chat_id=%s filename=%s", chat_id, path.name)
     gmail_result = await runtime.gmail.send_archive(
         path,
@@ -641,12 +745,38 @@ async def _send_archive_then_gmail(
         expected_identity=identity,
         telegram_filename=delivered_name,
     )
+
     if gmail_result.get("duplicate_skipped"):
-        return f"DUPLICATE:{gmail_result.get('status') or 'unknown'}"
+        duplicate_status = str(gmail_result.get("status") or "unknown")
+        # A prior ledger status=sent is a confirmed Gmail delivery. It is safe to
+        # perform cleanup only when this Telegram delivery is also confirmed.
+        if duplicate_status == "sent" and telegram_status == "CONFIRMED":
+            protected = set(runtime.active_archive_paths) - {path}
+            removed, failed = await asyncio.to_thread(
+                _cleanup_market_scan_archives, runtime.settings.exports_dir, protected
+            )
+            log.info("archive_cleanup completed removed=%s failed=%s trigger=gmail_ledger_sent", removed, failed)
+            return "SENT_ALREADY" if failed == 0 else f"SENT_ALREADY_CLEANUP_PARTIAL:{failed}"
+        return f"DUPLICATE:{duplicate_status}"
+
     state["gmail_archives_sent"] = int(state.get("gmail_archives_sent", 0)) + 1
     runtime.save_state()
     log.info("archive_delivery gmail_sent chat_id=%s filename=%s", chat_id, path.name)
-    return "SENT"
+
+    if telegram_status == "CONFIRMED":
+        protected = set(runtime.active_archive_paths) - {path}
+        removed, failed = await asyncio.to_thread(
+            _cleanup_market_scan_archives, runtime.settings.exports_dir, protected
+        )
+        log.info("archive_cleanup completed removed=%s failed=%s trigger=dual_confirmed", removed, failed)
+        if failed:
+            return f"SENT_CLEANUP_PARTIAL:{failed}"
+        return "SENT"
+
+    # Gmail is confirmed, but Telegram was intentionally not retried because its
+    # response was ambiguous. Keep local ZIPs as a safety copy; the next fully
+    # confirmed Telegram+Gmail cycle will remove all accumulated scan ZIPs.
+    return "SENT_TELEGRAM_UNCERTAIN"
 
 
 async def _safe_delete(message: Any) -> None:
@@ -755,9 +885,10 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
     lock = runtime.lock(chat_id)
     async with lock:
         state = runtime.chat_state(chat_id)
+        top_limit = runtime.top_limit(chat_id)
         state["scan_busy"] = True
         started = time.monotonic()
-        log.info("parquet started chat_id=%s show_progress=%s", chat_id, show_progress)
+        log.info("parquet started chat_id=%s show_progress=%s top_limit=%s", chat_id, show_progress, top_limit)
         holder: dict[str, Any] = {}
         semaphore_acquired = False
         try:
@@ -778,7 +909,9 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
                 if show_progress:
                     await _progress_message(application, chat_id, text, holder)  # type: ignore[arg-type]
 
-            result = await build_market_archive(runtime.settings, progress=progress)
+            result = await build_market_archive(runtime.settings, progress=progress, top_limit=top_limit)
+            runtime.active_archive_paths.add(result.archive_path)
+            holder["active_archive_path"] = result.archive_path
             state["scans_created"] = int(state.get("scans_created", 0)) + 1
             state["last_archive_name"] = result.archive_path.name
             state["last_archive_size_bytes"] = result.archive_size_bytes
@@ -802,10 +935,19 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
                 log.error("parquet delivery skipped chat_id=%s; current round result discarded", chat_id)
                 return
 
-            if gmail_status == "SENT":
-                follow = "📧 Следом отправлено в Gmail как .zip.jpg."
+            if gmail_status in {"SENT", "SENT_ALREADY"}:
+                follow = "📧 Следом отправлено в Gmail как .zip.jpg. Архивы сканов на VPS очищены."
+            elif gmail_status.startswith("SENT_CLEANUP_PARTIAL") or gmail_status.startswith("SENT_ALREADY_CLEANUP_PARTIAL"):
+                follow = f"📧 Gmail отправлен, но часть старых ZIP на VPS не удалилась: {gmail_status}."
+            elif gmail_status == "SENT_TELEGRAM_UNCERTAIN":
+                follow = (
+                    "📧 Gmail отправлен. Ответ Telegram на загрузку ZIP был неопределённым, поэтому ZIP повторно "
+                    "не отправлялся; локальная копия сохранена до следующего полностью подтверждённого цикла."
+                )
             elif gmail_status == "NOT_CONNECTED":
                 follow = "⚠️ Gmail не подключён. ZIP остался в Telegram. Нажми «Почта»."
+            elif gmail_status == "NOT_CONNECTED_TELEGRAM_UNCERTAIN":
+                follow = "⚠️ Ответ Telegram по ZIP был неопределённым, повтор не выполнялся; Gmail не подключён."
             elif gmail_status.startswith("DUPLICATE"):
                 follow = f"♻️ Gmail повтор заблокирован: {gmail_status}."
             else:
@@ -825,11 +967,18 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
         except (GmailAttachmentTooLarge, GmailArchiveChanged, GmailSendUncertain, GmailOAuthError) as exc:
             log.exception("Gmail delivery failed chat=%s", chat_id)
             state["last_gmail_status"] = f"ERROR:{type(exc).__name__}"
+            telegram_delivery = str(state.get("last_telegram_archive_status") or "")
+            if telegram_delivery == "CONFIRMED":
+                delivery_prefix = "ZIP в Telegram подтверждён, но"
+            elif telegram_delivery == "UNCERTAIN":
+                delivery_prefix = "Ответ Telegram по ZIP был неопределённым (повтор не делался), а"
+            else:
+                delivery_prefix = "После попытки доставки ZIP"
             await _telegram_delivery_with_retry(
                 "parquet gmail error",
                 lambda: application.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⚠️ ZIP в Telegram отправлен, но Gmail завершился ошибкой: {exc}",
+                    text=f"⚠️ {delivery_prefix} Gmail завершился ошибкой: {exc}",
                     reply_markup=_keyboard(runtime, chat_id),
                     connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
                 ),
@@ -847,6 +996,9 @@ async def _perform_parquet(application: Application, chat_id: int, *, show_progr
                 ),
             )
         finally:
+            active_archive_path = holder.get("active_archive_path")
+            if isinstance(active_archive_path, Path):
+                runtime.active_archive_paths.discard(active_archive_path)
             if semaphore_acquired:
                 runtime.scan_semaphore.release()
             finished = time.time()
@@ -949,6 +1101,24 @@ async def _manual_action(update: Update, context: ContextTypes.DEFAULT_TYPE, act
     else:
         await _perform_parquet(context.application, chat_id, show_progress=True)
     _schedule_auto(context.application, chat_id)
+
+
+async def top_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = _runtime(context)
+    if not _allowed(update, runtime):
+        return
+    chat_id = update.effective_chat.id
+    state = runtime.chat_state(chat_id)
+    current = runtime.top_limit(chat_id)
+    index = TOP_LIMITS.index(current)
+    new_limit = TOP_LIMITS[(index + 1) % len(TOP_LIMITS)]
+    state["top_limit"] = new_limit
+    runtime.save_state()
+    log.info("parquet top limit changed chat_id=%s old=%s new=%s", chat_id, current, new_limit)
+    await update.effective_message.reply_text(
+        f"Выбран топ-{new_limit} для Parquet.",
+        reply_markup=_keyboard(runtime, chat_id),
+    )
 
 
 async def analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1106,7 +1276,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/log_full — подробный журнал только за последние 24 часа.\n"
         "/status — состояние бота и последнего анализа/Parquet.\n"
         "/scan — Анализ; /parquet — собрать Parquet; /ping — проверка бота; /gmail — подключение почты.\n\n"
-        "Parquet: top-100 Binance Spot, 1H/1D/15m, Spot depth, breadth, MEXC funding/derivatives, XAU/XAG/USOIL и optional Deribit BTC/ETH options."
+        f"Parquet: top-{runtime.top_limit(chat_id)} Binance Spot, 1H/1D/15m, Spot depth, breadth, MEXC funding/derivatives, XAU/XAG/USOIL и optional Deribit BTC/ETH options. "
+        "Кнопка «Топ-100/150/200/250/300» циклически меняет только размер крипто-универсума Parquet."
     )
     await update.effective_message.reply_text(text, reply_markup=_keyboard(runtime, chat_id))
 
@@ -1247,13 +1418,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await parquet_export(update, context)
     elif low.startswith("время"):
         await time_toggle(update, context)
+    elif low in {"топ-100", "топ-150", "топ-200", "топ-250", "топ-300", "top-100", "top-150", "top-200", "top-250", "top-300"}:
+        await top_toggle(update, context)
     elif low in {"почта", "подключить почту"}:
         await gmail_command(update, context)
     elif low == "пинг":
         await ping(update, context)
     else:
         await update.effective_message.reply_text(
-            "Используй «Анализ», «Время», «Parquet», «Почта», «Пинг» или отправь 1.",
+            "Используй «Анализ», «Время», «Parquet», «Почта», «Пинг», «Топ-100/150/200/250/300» или отправь 1.",
             reply_markup=_keyboard(runtime, update.effective_chat.id),
         )
 
